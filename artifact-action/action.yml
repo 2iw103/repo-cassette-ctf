@@ -1,5 +1,5 @@
-name: Mint Repo Cassette payload
-description: Create a raw Actions artifact used by the Repo Cassette solver
+name: Probe Repo Cassette transports
+description: Reproduce GitHub transport behavior studied for Repo Cassette
 outputs:
   artifact_id:
     description: Numeric GitHub Actions artifact ID

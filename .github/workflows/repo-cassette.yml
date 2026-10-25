@@ -1,8 +1,7 @@
-name: Mint Repo Cassette payload
+name: Repo Cassette transport diagnostic
 
 on:
-  push:
-    branches: [main]
+  # Manual only: this diagnostic rewrites the current disposable job log.
   workflow_dispatch:
 
 permissions:
@@ -10,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  mint:
+  job-log-probe:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
