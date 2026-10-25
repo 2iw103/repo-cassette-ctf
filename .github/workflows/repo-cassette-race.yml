@@ -1,0 +1,30 @@
+name: Repo Cassette v6-v7 race
+
+on:
+  push:
+    paths:
+      - 'race-action/**'
+      - '.github/workflows/repo-cassette-race.yml'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: race
+        uses: ./race-action
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Record verified carrier
+        run: |
+          test -n "${{ steps.race.outputs.winner_artifact_id }}"
+          echo "artifact_id=${{ steps.race.outputs.winner_artifact_id }}"
+          echo "repository=${{ steps.race.outputs.winner_repository }}"
