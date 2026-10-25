@@ -1,0 +1,5 @@
+name: Repo Cassette parser probe
+description: Probe Actions Results JSON and protobuf parser behavior
+runs:
+  using: node20
+  main: raw-probe.js
