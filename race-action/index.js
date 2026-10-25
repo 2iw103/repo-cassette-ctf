@@ -12,9 +12,10 @@ const https = require('node:https');
 const SERVICE = 'github.actions.results.api.v1.ArtifactService';
 const ODD_TYPE = '\x85application/json';
 const ODD_HEX = Buffer.from(ODD_TYPE, 'latin1').toString('hex');
-const OFFSETS = [-16, -8, -4, -2, -1, 0, 1, 2, 4, 8, 16, 32];
-const REPEATS = 5;
-const BATCH = 12;
+const CREATE_OFFSETS = [-4, -2, -1, 0, 1, 2, 4];
+const FINALIZE_DELAYS = [0, 1, 2, 4, 8, 16];
+const REPEATS = 3;
+const BATCH = 14;
 
 function fail(message) { throw new Error(message); }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
@@ -141,7 +142,18 @@ function summarize(version, response) {
   };
 }
 
-async function raceCreate(client, path, token, ids, name, offset) {
+function summarizeFinalize(response) {
+  let value = {};
+  try { value = JSON.parse(response.body.toString()); } catch {}
+  return {
+    status: response.status,
+    ok: Boolean(value.ok),
+    artifactId: String(value.artifact_id || value.artifactId || ''),
+    message: String(value.msg || response.body.toString()).slice(0, 100),
+  };
+}
+
+async function raceLifecycle(client, createPath, finalizePath, token, ids, name, offset, finalizeDelay) {
   const specs = [[6, ODD_TYPE], [7, 'application/json']];
   let bodies = specs.map(([version, mime]) => Buffer.from(JSON.stringify({
     workflow_run_backend_id: ids.run,
@@ -152,14 +164,33 @@ async function raceCreate(client, path, token, ids, name, offset) {
   })));
   const length = Math.max(...bodies.map(body => body.length));
   bodies = bodies.map(body => Buffer.concat([body, Buffer.alloc(length - body.length, 0x20)]));
-  const staged = await Promise.all(bodies.map(body => stageH2(client, path, token, body)));
+  const finalizeBody = Buffer.from(JSON.stringify({
+    workflow_run_backend_id: ids.run,
+    workflow_job_run_backend_id: ids.job,
+    name,
+    size: '214',
+  }));
+  const staged = await Promise.all(bodies.map(body => stageH2(client, createPath, token, body)));
+  const finalizers = await Promise.all([
+    stageH2(client, finalizePath, token, finalizeBody),
+    stageH2(client, finalizePath, token, finalizeBody),
+  ]);
   const first = offset >= 0 ? 0 : 1;
   const second = first ^ 1;
   staged[first].release();
   if (offset === 0) staged[second].release();
   else setTimeout(() => staged[second].release(), Math.abs(offset));
-  const responses = await Promise.all(staged.map(item => item.result));
-  return responses.map((response, i) => summarize(specs[i][0], response));
+  if (finalizeDelay === 0) finalizers[0].release();
+  else setTimeout(() => finalizers[0].release(), finalizeDelay);
+  setTimeout(() => finalizers[1].release(), finalizeDelay + 1);
+  const [responses, finalizeResponses] = await Promise.all([
+    Promise.all(staged.map(item => item.result)),
+    Promise.all(finalizers.map(item => item.result)),
+  ]);
+  return {
+    creations: responses.map((response, i) => summarize(specs[i][0], response)),
+    finalizations: finalizeResponses.map(summarizeFinalize),
+  };
 }
 
 function carrier(repositoryPath) {
@@ -213,42 +244,42 @@ async function finish(candidate, token, ids, repository) {
   const base = {
     index: candidate.index,
     offsetMs: candidate.offset,
+    finalizeDelayMs: candidate.finalizeDelay,
     create: candidate.creations.map(x => ({
       version: x.version, status: x.status, ok: x.ok, pathHash: x.pathHash, message: x.message,
     })),
+    earlyFinalize: candidate.finalizations,
     sameBlobPath: created.length === 2 && created[0].pathHash === created[1].pathHash,
   };
   if (created.length < 2) return {...base, stage: 'create'};
 
-  const placeholder = Buffer.from('{"probe":"placeholder"}');
-  await Promise.all(created.map(x => putBlob(x.url, placeholder)));
-  const finalized = await twirp('FinalizeArtifact', token, {
-    workflow_run_backend_id: ids.run,
-    workflow_job_run_backend_id: ids.job,
-    name: candidate.name,
-    size: String(placeholder.length),
-  });
-  const artifactId = String(finalized.artifact_id || finalized.artifactId || '');
-  if (!finalized.ok || !/^\d+$/.test(artifactId)) return {...base, stage: 'finalize'};
-
-  const repositoryPath = `${repository}/actions/artifacts/${artifactId}/zip`;
-  const body = carrier(repositoryPath);
-  await Promise.all(created.map(x => putBlob(x.url, body)));
-  const signed = await twirp('GetSignedArtifactURL', token, {
-    workflow_run_backend_id: ids.run,
-    workflow_job_run_backend_id: ids.job,
-    name: candidate.name,
-  });
-  const direct = wireSummary(await getWithRetries(signed.signed_url || signed.signedUrl, {
-    'user-agent': 'repo-cassette-race-verifier',
-  }), body);
-  const result = {...base, artifactId, repositoryPath, direct, winner: false};
-  if (direct.status === 200 && direct.contentTypeHex === ODD_HEX && direct.bodyMatch) {
-    const rest = await verifyRest(repositoryPath, process.env.GITHUB_TOKEN, body);
-    result.rest = rest;
-    result.winner = rest.status === 200 && rest.contentTypeHex === ODD_HEX && rest.bodyMatch;
+  let artifactIds = [...new Set(candidate.finalizations
+    .filter(x => x.status >= 200 && x.status < 300 && x.ok && /^\d+$/.test(x.artifactId))
+    .map(x => x.artifactId))];
+  if (!artifactIds.length) {
+    const finalized = await twirp('FinalizeArtifact', token, {
+      workflow_run_backend_id: ids.run,
+      workflow_job_run_backend_id: ids.job,
+      name: candidate.name,
+      size: '214',
+    });
+    const artifactId = String(finalized.artifact_id || finalized.artifactId || '');
+    if (finalized.ok && /^\d+$/.test(artifactId)) artifactIds = [artifactId];
   }
-  return result;
+  if (!artifactIds.length) return {...base, stage: 'finalize'};
+
+  const checks = [];
+  for (const artifactId of artifactIds) {
+    const repositoryPath = `${repository}/actions/artifacts/${artifactId}/zip`;
+    const body = carrier(repositoryPath);
+    await Promise.all(created.map(x => putBlob(x.url, body)));
+    const rest = await verifyRest(repositoryPath, process.env.GITHUB_TOKEN, body);
+    checks.push({artifactId, repositoryPath, rest});
+    if (rest.status === 200 && rest.contentTypeHex === ODD_HEX && rest.bodyMatch) {
+      return {...base, artifactId, repositoryPath, checks, winner: true};
+    }
+  }
+  return {...base, artifactIds, checks, winner: false};
 }
 
 function output(name, value) {
@@ -261,20 +292,28 @@ async function main() {
   if (!token || !process.env.GITHUB_TOKEN || !repository) fail('Actions environment incomplete');
   const ids = backendIds(token);
   const origin = new URL(process.env.ACTIONS_RESULTS_URL).origin;
-  const path = `/twirp/${SERVICE}/CreateArtifact`;
+  const createPath = `/twirp/${SERVICE}/CreateArtifact`;
+  const finalizePath = `/twirp/${SERVICE}/FinalizeArtifact`;
   const client = await connectH2(origin);
-  const offsets = Array.from({length: REPEATS}, () => OFFSETS).flat();
+  const patterns = [];
+  for (let repeat = 0; repeat < REPEATS; repeat += 1) {
+    for (const offset of CREATE_OFFSETS) {
+      for (const finalizeDelay of FINALIZE_DELAYS) patterns.push({offset, finalizeDelay});
+    }
+  }
   let processed = 0;
   try {
-    for (let base = 0; base < offsets.length; base += BATCH) {
-      const specs = offsets.slice(base, base + BATCH).map((offset, slot) => ({
+    for (let base = 0; base < patterns.length; base += BATCH) {
+      const specs = patterns.slice(base, base + BATCH).map((pattern, slot) => ({
         index: base + slot,
-        offset,
+        ...pattern,
         name: `repo-cassette-h2-${process.env.GITHUB_RUN_ID}-${process.env.RACE_SHARD || 0}-${base + slot}-${crypto.randomBytes(4).toString('hex')}`,
       }));
       const raced = await Promise.all(specs.map(async item => ({
         ...item,
-        creations: await raceCreate(client, path, token, ids, item.name, item.offset),
+        ...await raceLifecycle(
+          client, createPath, finalizePath, token, ids, item.name, item.offset, item.finalizeDelay,
+        ),
       })));
       const settled = await Promise.allSettled(raced.map(item => finish(item, token, ids, repository)));
       for (const item of settled) {
@@ -292,7 +331,7 @@ async function main() {
   } finally {
     client.close();
   }
-  console.log(`RACE_SUMMARY ${JSON.stringify({processed, offsets: OFFSETS})}`);
+  console.log(`RACE_SUMMARY ${JSON.stringify({processed, createOffsets: CREATE_OFFSETS, finalizeDelays: FINALIZE_DELAYS})}`);
   fail('no verified carrier');
 }
 
