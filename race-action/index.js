@@ -183,9 +183,13 @@ async function raceLifecycle(client, createPath, finalizePath, token, ids, name,
   staged[first].release();
   if (offset === 0) staged[second].release();
   else setTimeout(() => staged[second].release(), Math.abs(offset));
-  if (finalizeDelay === 0) finalizers[0].release();
-  else setTimeout(() => finalizers[0].release(), finalizeDelay);
-  setTimeout(() => finalizers[1].release(), finalizeDelay + 1);
+  // A finalize sent before either Create commits is rejected with 404. Release
+  // it immediately after the first Create response, while the competing
+  // Create can still be completing its response/replication path.
+  await Promise.race(staged.map(item => item.result));
+  if (finalizeDelay) await sleep(finalizeDelay);
+  finalizers[0].release();
+  setTimeout(() => finalizers[1].release(), 1);
   const [responses, finalizeResponses] = await Promise.all([
     Promise.all(staged.map(item => item.result)),
     Promise.all(finalizers.map(item => item.result)),
