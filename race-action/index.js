@@ -259,17 +259,7 @@ async function finish(candidate, token, ids, repository) {
   let artifactIds = [...new Set(candidate.finalizations
     .filter(x => x.status >= 200 && x.status < 300 && x.ok && /^\d+$/.test(x.artifactId))
     .map(x => x.artifactId))];
-  if (!artifactIds.length) {
-    const finalized = await twirp('FinalizeArtifact', token, {
-      workflow_run_backend_id: ids.run,
-      workflow_job_run_backend_id: ids.job,
-      name: candidate.name,
-      size: '214',
-    });
-    const artifactId = String(finalized.artifact_id || finalized.artifactId || '');
-    if (finalized.ok && /^\d+$/.test(artifactId)) artifactIds = [artifactId];
-  }
-  if (!artifactIds.length) return {...base, stage: 'finalize'};
+  if (!artifactIds.length) return {...base, stage: 'early-finalize'};
 
   const checks = [];
   for (const artifactId of artifactIds) {
