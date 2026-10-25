@@ -237,24 +237,11 @@ async function verifyRestArtifact(repositoryPath, token, expectedBody) {
 }
 
 async function probeMimeStrategies(token, githubRepository, ids) {
-  const omitted = Symbol('omitted');
   const candidates = [
-    ['v7-fs1c', 7, 'application/json\x1c'],
-    ['v7-fs1d', 7, 'application/json\x1d'],
-    ['v7-fs1e', 7, 'application/json\x1e'],
-    ['v7-fs1f', 7, 'application/json\x1f'],
-    ['v7-nel', 7, WEIRD_CONTENT_TYPE],
-    ['v7-space-nel', 7, `application/json ${WEIRD_CONTENT_TYPE.slice(-1)}`],
-    ['v7-nel-space', 7, `${WEIRD_CONTENT_TYPE} `],
-    ['v7-omit', 7, omitted],
-    ['v7-empty', 7, ''],
-    ['v6-nel', 6, WEIRD_CONTENT_TYPE],
-    ['v6-omit', 6, omitted],
-    ['v5-nel', 5, WEIRD_CONTENT_TYPE],
-    ['v5-omit', 5, omitted],
-    ['v4-nel', 4, WEIRD_CONTENT_TYPE],
-    ['v4-omit', 4, omitted],
-    ['v8-nel', 8, WEIRD_CONTENT_TYPE],
+    ['v7-percent85', 7, 'application/json%85'],
+    ['v7-percent2585', 7, 'application/json%2585'],
+    ['v7-percentc285', 7, 'application/json%C2%85'],
+    ['v7-json-control', 7, 'application/json'],
   ];
   const run = process.env.GITHUB_RUN_ID || Date.now();
   const attempt = process.env.GITHUB_RUN_ATTEMPT || 1;
@@ -265,7 +252,7 @@ async function probeMimeStrategies(token, githubRepository, ids) {
       name: `mime-probe-${run}-${attempt}-${label}`,
     };
     const createRequest = { ...common, version };
-    if (mimeType !== omitted) createRequest.mime_type = mimeType;
+    createRequest.mime_type = mimeType;
     try {
       const created = await twirp('CreateArtifact', token, createRequest);
       const signedUploadUrl = created.signed_upload_url || created.signedUploadUrl;
