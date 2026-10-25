@@ -13,6 +13,12 @@ permissions:
 
 jobs:
   build-and-verify:
+    name: race-shard-${{ matrix.shard }}
+    strategy:
+      fail-fast: false
+      max-parallel: 7
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6]
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
@@ -23,6 +29,7 @@ jobs:
         uses: ./race-action
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          RACE_SHARD: ${{ matrix.shard }}
       - name: Record verified carrier
         run: |
           test -n "${{ steps.race.outputs.winner_artifact_id }}"
