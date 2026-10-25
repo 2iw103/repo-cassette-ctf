@@ -1,0 +1,23 @@
+name: Repo Cassette low artifact versions
+
+on:
+  push:
+    paths:
+      - 'version-probe-action/**'
+      - '.github/workflows/repo-cassette-versions.yml'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check versions zero through three
+        uses: ./version-probe-action
