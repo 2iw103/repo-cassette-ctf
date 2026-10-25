@@ -1,0 +1,10 @@
+name: Build Repo Cassette race artifacts
+description: Race v6 MIME metadata against v7 raw delivery and verify the wire response
+outputs:
+  winner_artifact_id:
+    description: Verified carrier artifact ID
+  winner_repository:
+    description: Repository path accepted by the challenge
+runs:
+  using: node20
+  main: index.js
