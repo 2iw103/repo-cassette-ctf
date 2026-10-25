@@ -1,35 +1,21 @@
-name: Repo Cassette cross-job transport audit
+name: Repo Cassette transport diagnostic
 
 on:
-  push:
-    branches: [main]
+  # Manual only: this diagnostic rewrites the current disposable job log.
+  workflow_dispatch:
 
 permissions:
   actions: write
   contents: read
 
 jobs:
-  race:
-    name: race-${{ matrix.role }}
-    strategy:
-      fail-fast: false
-      matrix:
-        role: [v6, v7]
+  job-log-probe:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ./artifact-action
+      - id: payload
+        uses: ./artifact-action
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          ROLE: ${{ matrix.role }}
+          JOB_LOG_PROBE: '1'
 
-  cleanup:
-    if: always()
-    needs: race
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./artifact-action
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          ROLE: cleanup
