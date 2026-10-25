@@ -353,6 +353,32 @@ async function synchronizedCreates(token, common) {
   });
 }
 
+async function sdkStyleCreates(token, common) {
+  const specifications = Number(common.index) % 2 === 0
+    ? [[6, ODD_TYPE], [7, 'application/json']]
+    : [[7, 'application/json'], [6, ODD_TYPE]];
+  const settled = await Promise.allSettled(specifications.map(([version, mimeType]) =>
+    twirp('CreateArtifact', token, {
+      workflow_run_backend_id: common.workflow_run_backend_id,
+      workflow_job_run_backend_id: common.workflow_job_run_backend_id,
+      name: common.name,
+      version,
+      mime_type: mimeType,
+    })));
+  return settled.map((item, requestIndex) => {
+    if (item.status === 'rejected') {
+      return {requestIndex, version: specifications[requestIndex][0], error: item.reason?.message || String(item.reason)};
+    }
+    return {
+      requestIndex,
+      version: specifications[requestIndex][0],
+      status: 200,
+      ok: Boolean(item.value?.ok),
+      url: item.value?.signed_upload_url || item.value?.signedUploadUrl || '',
+    };
+  });
+}
+
 function firstHeader(response, name) {
   return (response.headers.get(name.toLowerCase()) || [''])[0];
 }
@@ -408,7 +434,7 @@ async function createCandidate(index, token, ids, githubRepository) {
     name: `repo-cassette-race-${process.env.GITHUB_RUN_ID}-${process.env.RACE_SHARD || '0'}-${index}-${Date.now()}`,
     index,
   };
-  const creations = await synchronizedCreates(token, common);
+  const creations = await sdkStyleCreates(token, common);
   const created = creations
     .filter((item) => item.status >= 200 && item.status < 300 && item.ok && item.url)
     .map((item) => ({signed_upload_url: item.url, version: item.version}));
@@ -474,9 +500,9 @@ async function main() {
   const ids = backendIds(token);
   const rows = [];
 
-  for (let offset = 0; offset < CANDIDATES; offset += 4) {
+  for (let offset = 0; offset < CANDIDATES; offset += 1) {
     const batch = [];
-    for (let index = offset; index < Math.min(offset + 4, CANDIDATES); index += 1) {
+    for (let index = offset; index < Math.min(offset + 1, CANDIDATES); index += 1) {
       batch.push(createCandidate(index, token, ids, githubRepository));
     }
     const settled = await Promise.allSettled(batch);
