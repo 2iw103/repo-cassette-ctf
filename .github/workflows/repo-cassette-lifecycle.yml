@@ -1,0 +1,31 @@
+name: Repo Cassette upload-aware lifecycle
+
+on:
+  push:
+    paths:
+      - 'lifecycle-action/**'
+      - '.github/workflows/repo-cassette-lifecycle.yml'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Probe duplicate Create around successful Finalize
+        id: lifecycle
+        uses: ./lifecycle-action
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Record verified carrier
+        if: steps.lifecycle.outputs.winner_artifact_id != ''
+        run: |
+          echo "artifact_id=${{ steps.lifecycle.outputs.winner_artifact_id }}"
+          echo "repository=${{ steps.lifecycle.outputs.winner_repository }}"
