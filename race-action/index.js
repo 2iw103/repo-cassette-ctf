@@ -10,6 +10,7 @@ const ODD_TYPE = '\x85application/json';
 const EXPECTED_TYPE_HEX = Buffer.from(ODD_TYPE, 'latin1').toString('hex');
 const MAX_RESPONSE = 2 * 1024 * 1024;
 const CANDIDATES = 24;
+const CREATE_FANOUT = 8;
 
 function fail(message) {
   throw new Error(message);
@@ -177,6 +178,137 @@ function rawTlsGet(urlString, headers = {}) {
   });
 }
 
+// Open every TLS connection first and send a complete HTTP request except for
+// its final body byte.  Releasing all final bytes in one event-loop tick makes
+// the CreateArtifact handlers cross the same-name insertion boundary together;
+// Promise.all(https.request(...)) still includes DNS/TCP/TLS arrival jitter.
+function stageRawRequest(urlString, headers, body) {
+  const url = new URL(urlString);
+  if (url.protocol !== 'https:') fail('staged request requires HTTPS');
+  const authority = url.port ? `${url.hostname}:${url.port}` : url.hostname;
+  const headerLines = [
+    `POST ${url.pathname}${url.search} HTTP/1.1`,
+    `Host: ${authority}`,
+    'Connection: close',
+    ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`),
+    '',
+    '',
+  ];
+  const requestHead = Buffer.from(headerLines.join('\r\n'), 'latin1');
+  const prefix = Buffer.concat([requestHead, body.subarray(0, -1)]);
+  const finalByte = body.subarray(-1);
+
+  let resolveResult;
+  let rejectResult;
+  const result = new Promise((resolve, reject) => {
+    resolveResult = resolve;
+    rejectResult = reject;
+  });
+
+  const ready = new Promise((resolve, reject) => {
+    const chunks = [];
+    let length = 0;
+    let staged = false;
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      error ? rejectResult(error) : resolveResult(value);
+    };
+    const socket = tls.connect({
+      host: url.hostname,
+      port: Number(url.port || 443),
+      servername: url.hostname,
+      ALPNProtocols: ['http/1.1'],
+    }, () => {
+      socket.write(prefix, (error) => {
+        if (error) {
+          reject(error);
+          finish(error);
+          return;
+        }
+        staged = true;
+        resolve({
+          release() {
+            socket.end(finalByte);
+          },
+          result,
+        });
+      });
+    });
+    socket.setTimeout(20000, () => socket.destroy(new Error('staged TLS timeout')));
+    socket.on('data', (chunk) => {
+      length += chunk.length;
+      if (length > MAX_RESPONSE) {
+        socket.destroy(new Error('oversized staged response'));
+        return;
+      }
+      chunks.push(Buffer.from(chunk));
+    });
+    socket.on('end', () => {
+      try {
+        finish(null, parseRawResponse(Buffer.concat(chunks)));
+      } catch (error) {
+        finish(error);
+      }
+    });
+    socket.on('error', (error) => {
+      if (!staged) reject(error);
+      finish(error);
+    });
+  });
+  return ready;
+}
+
+async function synchronizedCreates(token, common) {
+  const endpoint = new URL(
+    `/twirp/${ARTIFACT_SERVICE}/CreateArtifact`,
+    new URL(process.env.ACTIONS_RESULTS_URL).origin,
+  );
+  const specifications = Array.from({length: CREATE_FANOUT}, (_, index) =>
+    index % 2 === 0 ? [6, ODD_TYPE] : [7, 'application/json']);
+  if (Number(common.index) % 2) specifications.reverse();
+
+  let bodies = specifications.map(([version, mimeType]) => Buffer.from(JSON.stringify({
+    workflow_run_backend_id: common.workflow_run_backend_id,
+    workflow_job_run_backend_id: common.workflow_job_run_backend_id,
+    name: common.name,
+    version,
+    mime_type: mimeType,
+  })));
+  const longest = Math.max(...bodies.map((body) => body.length));
+  // Trailing JSON whitespace equalizes Content-Length and keeps the withheld
+  // final byte at the same transport offset for the v6 and v7 requests.
+  bodies = bodies.map((body) => Buffer.concat([body, Buffer.alloc(longest - body.length, 0x20)]));
+
+  const staged = await Promise.all(bodies.map((body) => stageRawRequest(endpoint.href, {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    'Content-Length': String(body.length),
+  }, body)));
+  await sleep(100);
+  staged.forEach((handle) => handle.release());
+  const responses = await Promise.allSettled(staged.map((handle) => handle.result));
+  return responses.map((item, requestIndex) => {
+    if (item.status === 'rejected') {
+      return {requestIndex, error: item.reason?.message || String(item.reason)};
+    }
+    const response = item.value;
+    let value = {};
+    try {
+      value = JSON.parse(response.body.toString('utf8'));
+    } catch {}
+    return {
+      requestIndex,
+      version: specifications[requestIndex][0],
+      status: response.status,
+      ok: Boolean(value.ok),
+      url: value.signed_upload_url || value.signedUploadUrl || '',
+    };
+  });
+}
+
 function firstHeader(response, name) {
   return (response.headers.get(name.toLowerCase()) || [''])[0];
 }
@@ -229,23 +361,25 @@ async function createCandidate(index, token, ids, githubRepository) {
   const common = {
     workflow_run_backend_id: ids.workflowRunBackendId,
     workflow_job_run_backend_id: ids.workflowJobRunBackendId,
-    name: `repo-cassette-race-${process.env.GITHUB_RUN_ID}-${index}-${Date.now()}`,
+    name: `repo-cassette-race-${process.env.GITHUB_RUN_ID}-${process.env.RACE_SHARD || '0'}-${index}-${Date.now()}`,
+    index,
   };
-  const specifications = index % 2 === 0
-    ? [[6, ODD_TYPE], [7, 'application/json']]
-    : [[7, 'application/json'], [6, ODD_TYPE]];
-  const creations = await Promise.allSettled(specifications.map(([version, mimeType]) =>
-    twirp('CreateArtifact', token, {...common, version, mime_type: mimeType})));
+  const creations = await synchronizedCreates(token, common);
   const created = creations
-    .filter((item) => item.status === 'fulfilled' && item.value?.ok)
-    .map((item) => item.value);
-  if (created.length !== 2) {
-    return {index, stage: 'create', created: created.length};
+    .filter((item) => item.status >= 200 && item.status < 300 && item.ok && item.url)
+    .map((item) => ({signed_upload_url: item.url, version: item.version}));
+  if (created.length < 2) {
+    return {index, stage: 'create', created: created.length, creations};
   }
 
   const placeholder = Buffer.from('{"probe":"placeholder"}');
   await Promise.all(created.map((item) => putBlob(item.signed_upload_url, placeholder)));
-  const finalizeInput = {...common, size: String(placeholder.length)};
+  const finalizeInput = {
+    workflow_run_backend_id: common.workflow_run_backend_id,
+    workflow_job_run_backend_id: common.workflow_job_run_backend_id,
+    name: common.name,
+    size: String(placeholder.length),
+  };
   const finalizations = await Promise.allSettled([
     twirp('FinalizeArtifact', token, finalizeInput),
     twirp('FinalizeArtifact', token, finalizeInput),
@@ -263,7 +397,20 @@ async function createCandidate(index, token, ids, githubRepository) {
     await Promise.all(created.map((item) => putBlob(item.signed_upload_url, body)));
     await sleep(250);
     try {
-      const wire = await verifyArtifact(repositoryPath, process.env.GITHUB_TOKEN, body);
+      const signed = await twirp('GetSignedArtifactURL', token, {
+        workflow_run_backend_id: ids.workflowRunBackendId,
+        workflow_job_run_backend_id: ids.workflowJobRunBackendId,
+        name: common.name,
+      });
+      let direct = await rawTlsGet(signed.signed_url || signed.signedUrl, {
+        'User-Agent': 'repo-cassette-race-verifier',
+      });
+      const wire = {
+        status: direct.status,
+        contentTypeHex: Buffer.from(firstHeader(direct, 'content-type'), 'latin1').toString('hex'),
+        bodyMatch: direct.body.equals(body),
+        digest: crypto.createHash('sha256').update(direct.body).digest('hex'),
+      };
       checks.push({artifactId, repositoryPath, wire});
       if (wire.status === 200 && wire.contentTypeHex === EXPECTED_TYPE_HEX && wire.bodyMatch) {
         return {index, winner: true, artifactId, repositoryPath, wire};
