@@ -260,6 +260,49 @@ function stageRawRequest(urlString, headers, body) {
   return ready;
 }
 
+function stageHttpsRequest(urlString, headers, body) {
+  const prefix = body.subarray(0, -1);
+  const finalByte = body.subarray(-1);
+  let resolveResult;
+  let rejectResult;
+  const result = new Promise((resolve, reject) => {
+    resolveResult = resolve;
+    rejectResult = reject;
+  });
+  const ready = new Promise((resolve, reject) => {
+    let staged = false;
+    const req = https.request(urlString, {method: 'POST', headers}, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      response.on('end', () => resolveResult({
+        status: response.statusCode || 0,
+        headers: response.headers,
+        body: Buffer.concat(chunks),
+      }));
+    });
+    req.setTimeout(20000, () => req.destroy(new Error('staged HTTPS timeout')));
+    req.on('error', (error) => {
+      if (!staged) reject(error);
+      rejectResult(error);
+    });
+    req.write(prefix, (error) => {
+      if (error) {
+        reject(error);
+        rejectResult(error);
+        return;
+      }
+      staged = true;
+      resolve({
+        release() {
+          req.end(finalByte);
+        },
+        result,
+      });
+    });
+  });
+  return ready;
+}
+
 async function synchronizedCreates(token, common) {
   const endpoint = new URL(
     `/twirp/${ARTIFACT_SERVICE}/CreateArtifact`,
@@ -281,7 +324,7 @@ async function synchronizedCreates(token, common) {
   // final byte at the same transport offset for the v6 and v7 requests.
   bodies = bodies.map((body) => Buffer.concat([body, Buffer.alloc(longest - body.length, 0x20)]));
 
-  const staged = await Promise.all(bodies.map((body) => stageRawRequest(endpoint.href, {
+  const staged = await Promise.all(bodies.map((body) => stageHttpsRequest(endpoint.href, {
     Authorization: `Bearer ${token}`,
     Accept: 'application/json',
     'Content-Type': 'application/json',
