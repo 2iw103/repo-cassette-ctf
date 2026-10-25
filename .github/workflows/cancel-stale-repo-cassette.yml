@@ -18,7 +18,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPOSITORY: ${{ github.repository }}
         run: |
-          for run_id in 40179176088 40179318352; do
+          for run_id in 40179329972; do
             curl --fail-with-body --silent --show-error \
               --request POST \
               --header "Accept: application/vnd.github+json" \
