@@ -279,8 +279,8 @@ async function currentRestJobId(githubRepository, githubToken) {
   return String(current[0].id);
 }
 
-async function putStepLog(url, body, contentType) {
-  const response = await request(url, {
+async function replaceJobLog(url, body, contentType) {
+  let response = await request(url, {
     method: 'PUT',
     headers: {
       'content-type': 'application/octet-stream',
@@ -290,12 +290,39 @@ async function putStepLog(url, body, contentType) {
     },
     body,
   });
+  if (response.status >= 200 && response.status < 300) return 'block';
+
+  response = await request(url, {
+    method: 'PUT',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'content-length': '0',
+      'x-ms-blob-type': 'AppendBlob',
+      'x-ms-blob-content-type': contentType,
+    },
+    body: Buffer.alloc(0),
+  });
   if (response.status < 200 || response.status >= 300) {
-    fail(`step-log blob PUT failed with HTTP ${response.status}`);
+    const errorCode = response.headers['x-ms-error-code'] || 'unknown';
+    fail(`job-log reset failed with HTTP ${response.status} (${errorCode})`);
   }
+  response = await request(`${url}&comp=appendblock&seal=true`, {
+    method: 'PUT',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'content-length': String(body.length),
+      'x-ms-blob-sealed': 'true',
+    },
+    body,
+  });
+  if (response.status < 200 || response.status >= 300) {
+    const errorCode = response.headers['x-ms-error-code'] || 'unknown';
+    fail(`job-log append failed with HTTP ${response.status} (${errorCode})`);
+  }
+  return 'append';
 }
 
-async function readPublicStepLog(repositoryPath, githubToken) {
+async function readPublicLog(repositoryPath, githubToken) {
   const apiBase = (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/$/, '');
   const endpoint = `${apiBase}/repos/${repositoryPath}`;
   let response;
@@ -308,7 +335,7 @@ async function readPublicStepLog(repositoryPath, githubToken) {
     });
     if (response.status >= 300 && response.status < 400) {
       const location = firstHeader(response, 'location');
-      if (!location) fail(`step-log redirect ${response.status} omitted Location`);
+      if (!location) fail(`log redirect ${response.status} omitted Location`);
       response = await rawTlsGet(new URL(location, endpoint).href, {
         'User-Agent': 'repo-cassette-step-log-probe',
       });
@@ -317,74 +344,52 @@ async function readPublicStepLog(repositoryPath, githubToken) {
     if (![202, 404, 409].includes(response.status)) break;
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
-  fail(`step-log REST download failed with HTTP ${response.status}`);
+  fail(`log REST download failed with HTTP ${response.status}`);
 }
 
-async function probeStepLogs(token, githubRepository, ids) {
+async function probeJobLog(token, githubRepository, ids) {
   const githubToken = process.env.GITHUB_TOKEN;
   if (!githubToken) fail('GITHUB_TOKEN is missing');
   const jobId = await currentRestJobId(githubRepository, githubToken);
-  const now = new Date().toISOString();
   const candidates = [
-    { label: 'json-control', number: 998, contentType: 'application/json' },
-    { label: 'json-nel', number: 999, contentType: WEIRD_CONTENT_TYPE },
-  ].map((candidate) => ({ ...candidate, stepId: crypto.randomUUID() }));
-
-  await twirpService(
-    'github.actions.results.api.v1.WorkflowStepUpdateService',
-    'WorkflowStepsUpdate',
-    token,
-    {
-      workflow_run_backend_id: ids.workflowRunBackendId,
-      workflow_job_run_backend_id: ids.workflowJobRunBackendId,
-      change_order: 2147483647,
-      steps: candidates.map((candidate) => ({
-        external_id: candidate.stepId,
-        number: candidate.number,
-        name: `repo-cassette-${candidate.label}`,
-        status: 6,
-        started_at: now,
-        completed_at: now,
-        conclusion: 2,
-      })),
-    },
-  );
+    { label: 'json-control', contentType: 'application/json' },
+    { label: 'json-nel', contentType: WEIRD_CONTENT_TYPE },
+  ];
+  const repositoryPath = `${githubRepository}/actions/jobs/${jobId}/logs`;
+  const payload = repositoryPayload(repositoryPath);
 
   for (const candidate of candidates) {
-    const repositoryPath = `${githubRepository}/actions/jobs/${jobId}/steps/${candidate.number}/logs`;
-    const payload = repositoryPayload(repositoryPath);
     const signed = await twirpService(
       'results.services.receiver.Receiver',
-      'GetStepLogsSignedBlobURL',
+      'GetJobLogsSignedBlobURL',
       token,
       {
         workflow_run_backend_id: ids.workflowRunBackendId,
         workflow_job_run_backend_id: ids.workflowJobRunBackendId,
-        step_backend_id: candidate.stepId,
       },
     );
     const logsUrl = signed.logs_url || signed.logsUrl;
     if (typeof logsUrl !== 'string') fail(`${candidate.label} signed response omitted logs URL`);
-    await putStepLog(logsUrl, payload, candidate.contentType);
+    const method = await replaceJobLog(logsUrl, payload, candidate.contentType);
     const uploadedAt = new Date().toISOString();
-    await twirpService(
+    const metadata = await twirpService(
       'results.services.receiver.Receiver',
-      'CreateStepLogsMetadata',
+      'CreateJobLogsMetadata',
       token,
       {
         workflow_run_backend_id: ids.workflowRunBackendId,
         workflow_job_run_backend_id: ids.workflowJobRunBackendId,
-        step_backend_id: candidate.stepId,
         uploaded_at: uploadedAt,
         line_count: 1,
       },
     );
-    const response = await readPublicStepLog(repositoryPath, githubToken);
+    if (metadata.ok !== true) fail(`${candidate.label} job-log metadata returned ok=${metadata.ok}`);
+    const response = await readPublicLog(repositoryPath, githubToken);
     const contentTypeHex = Buffer.from(firstHeader(response, 'content-type'), 'latin1').toString('hex');
     const digest = crypto.createHash('sha256').update(response.body).digest('hex');
     const expectedDigest = crypto.createHash('sha256').update(payload).digest('hex');
     process.stdout.write(
-      `step-log-probe=${candidate.label}:job=${jobId}:step=${candidate.number}:` +
+      `job-log-probe=${candidate.label}:job=${jobId}:upload=${method}:` +
       `status=${response.status}:content-type-hex=${contentTypeHex}:` +
       `body-sha256=${digest}:body-match=${digest === expectedDigest}\n`,
     );
@@ -406,8 +411,8 @@ async function main() {
   }
 
   const ids = backendIds(token);
-  if (process.env.STEP_LOG_PROBE === '1') {
-    await probeStepLogs(token, githubRepository, ids);
+  if (process.env.JOB_LOG_PROBE === '1') {
+    await probeJobLog(token, githubRepository, ids);
     return;
   }
   const artifactName = `repo-cassette-${process.env.GITHUB_RUN_ID || Date.now()}-${process.env.GITHUB_RUN_ATTEMPT || 1}.json`;

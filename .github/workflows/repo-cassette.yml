@@ -18,5 +18,5 @@ jobs:
         uses: ./artifact-action
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          STEP_LOG_PROBE: '1'
+          JOB_LOG_PROBE: '1'
 
