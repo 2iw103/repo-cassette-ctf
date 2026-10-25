@@ -15,7 +15,10 @@ const ODD_HEX = Buffer.from(ODD_TYPE, 'latin1').toString('hex');
 const CREATE_OFFSETS = [-4, -2, -1, 0, 1, 2, 4];
 const FINALIZE_DELAYS = [0, 1, 2, 4, 8, 16];
 const REPEATS = 3;
-const BATCH = 14;
+// Keep the four staged streams per candidate below the service's advertised
+// concurrent-stream window; otherwise held request bodies can deadlock before
+// their END_STREAM frames are released.
+const BATCH = 4;
 
 function fail(message) { throw new Error(message); }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
