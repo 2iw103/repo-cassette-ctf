@@ -1,0 +1,17 @@
+name: Mint Repo Cassette payload
+description: Create a raw Actions artifact used by the Repo Cassette solver
+outputs:
+  artifact_id:
+    description: Numeric GitHub Actions artifact ID
+  repository_path:
+    description: Value to pass as the challenge repository field
+  payload_sha256:
+    description: SHA-256 of the final raw artifact
+  payload_base64:
+    description: Exact final artifact body for the HAR response content
+  live_check:
+    description: REST body/hash and raw Content-Type verification result
+runs:
+  using: node20
+  main: index.js
+

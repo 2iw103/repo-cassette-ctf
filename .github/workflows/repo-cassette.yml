@@ -1,0 +1,28 @@
+name: Mint Repo Cassette payload
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: payload
+        uses: ./artifact-action
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Show artifact coordinates
+        run: |
+          echo 'artifact_id=${{ steps.payload.outputs.artifact_id }}'
+          echo 'repository_path=${{ steps.payload.outputs.repository_path }}'
+          echo 'payload_sha256=${{ steps.payload.outputs.payload_sha256 }}'
+          echo 'payload_base64=${{ steps.payload.outputs.payload_base64 }}'
+          echo 'live_check=${{ steps.payload.outputs.live_check }}'
+
