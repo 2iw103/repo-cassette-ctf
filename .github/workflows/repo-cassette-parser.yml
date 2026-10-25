@@ -20,6 +20,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Probe JSON and protobuf parser discrepancies
+        id: parser
+        uses: ./
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: node raw-probe.js
