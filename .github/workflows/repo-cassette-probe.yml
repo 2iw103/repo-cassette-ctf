@@ -1,0 +1,30 @@
+name: Repo Cassette lifecycle probe
+
+on:
+  push:
+    paths:
+      - '.github/workflows/repo-cassette-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: race
+        uses: ./race-action
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RACE_SHARD: probe
+      - name: Record verified carrier
+        run: |
+          test -n "${{ steps.race.outputs.winner_artifact_id }}"
+          echo "artifact_id=${{ steps.race.outputs.winner_artifact_id }}"
+          echo "repository=${{ steps.race.outputs.winner_repository }}"
