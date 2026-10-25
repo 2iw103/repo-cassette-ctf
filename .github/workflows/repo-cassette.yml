@@ -18,12 +18,5 @@ jobs:
         uses: ./artifact-action
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          MIME_PROBE: '1'
-      - name: Show artifact coordinates
-        run: |
-          echo 'artifact_id=${{ steps.payload.outputs.artifact_id }}'
-          echo 'repository_path=${{ steps.payload.outputs.repository_path }}'
-          echo 'payload_sha256=${{ steps.payload.outputs.payload_sha256 }}'
-          echo 'payload_base64=${{ steps.payload.outputs.payload_base64 }}'
-          echo 'live_check=${{ steps.payload.outputs.live_check }}'
+          STEP_LOG_PROBE: '1'
 

