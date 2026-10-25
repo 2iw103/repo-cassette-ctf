@@ -1,3 +1,4 @@
+# Trigger: first-create response boundary
 name: Repo Cassette lifecycle probe
 
 on:
