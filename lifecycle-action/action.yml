@@ -1,0 +1,10 @@
+name: Repo Cassette lifecycle probe
+description: Probe Create/PUT/Finalize ordering around a duplicate artifact name
+outputs:
+  winner_artifact_id:
+    description: Verified carrier artifact ID
+  winner_repository:
+    description: Repository path accepted by the challenge
+runs:
+  using: node20
+  main: index.js
