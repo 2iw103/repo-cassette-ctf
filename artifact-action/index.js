@@ -236,6 +236,72 @@ async function verifyRestArtifact(repositoryPath, token, expectedBody) {
   return { contentTypeHex: typeBytes.toString('hex'), digest: actualDigest };
 }
 
+async function probeMimeStrategies(token, githubRepository, ids) {
+  const omitted = Symbol('omitted');
+  const candidates = [
+    ['v7-fs1c', 7, 'application/json\x1c'],
+    ['v7-fs1d', 7, 'application/json\x1d'],
+    ['v7-fs1e', 7, 'application/json\x1e'],
+    ['v7-fs1f', 7, 'application/json\x1f'],
+    ['v7-nel', 7, WEIRD_CONTENT_TYPE],
+    ['v7-space-nel', 7, `application/json ${WEIRD_CONTENT_TYPE.slice(-1)}`],
+    ['v7-nel-space', 7, `${WEIRD_CONTENT_TYPE} `],
+    ['v7-omit', 7, omitted],
+    ['v7-empty', 7, ''],
+    ['v6-nel', 6, WEIRD_CONTENT_TYPE],
+    ['v6-omit', 6, omitted],
+    ['v5-nel', 5, WEIRD_CONTENT_TYPE],
+    ['v5-omit', 5, omitted],
+    ['v4-nel', 4, WEIRD_CONTENT_TYPE],
+    ['v4-omit', 4, omitted],
+    ['v8-nel', 8, WEIRD_CONTENT_TYPE],
+  ];
+  const run = process.env.GITHUB_RUN_ID || Date.now();
+  const attempt = process.env.GITHUB_RUN_ATTEMPT || 1;
+  for (const [label, version, mimeType] of candidates) {
+    const common = {
+      workflow_run_backend_id: ids.workflowRunBackendId,
+      workflow_job_run_backend_id: ids.workflowJobRunBackendId,
+      name: `mime-probe-${run}-${attempt}-${label}`,
+    };
+    const createRequest = { ...common, version };
+    if (mimeType !== omitted) createRequest.mime_type = mimeType;
+    try {
+      const created = await twirp('CreateArtifact', token, createRequest);
+      const signedUploadUrl = created.signed_upload_url || created.signedUploadUrl;
+      if (!created.ok || typeof signedUploadUrl !== 'string') fail('invalid create response');
+      const placeholder = Buffer.alloc(ARTIFACT_BYTES, 0x20);
+      await putBlob(signedUploadUrl, placeholder);
+      const finalized = await twirp('FinalizeArtifact', token, {
+        ...common,
+        size: String(placeholder.length),
+      });
+      const artifactId = String(finalized.artifact_id || finalized.artifactId || '');
+      if (!finalized.ok || !/^\d+$/.test(artifactId)) fail('invalid finalize response');
+      const repositoryPath = `${githubRepository}/actions/artifacts/${artifactId}/zip`;
+      const document = {
+        full_name: repositoryPath,
+        owner: { login: 'cassette', avatar_url: 'file:///proc/self/environ' },
+        description: '',
+        stargazers_count: 0,
+        padding: '',
+      };
+      const base = Buffer.from(JSON.stringify(document));
+      document.padding = 'A'.repeat(ARTIFACT_BYTES - base.length);
+      const payload = Buffer.from(JSON.stringify(document));
+      await putBlob(signedUploadUrl, payload);
+      try {
+        const verified = await verifyRestArtifact(repositoryPath, process.env.GITHUB_TOKEN, payload);
+        process.stdout.write(`probe=${label}:SUCCESS:${artifactId}:${verified.contentTypeHex}:${verified.digest}\n`);
+      } catch (error) {
+        process.stdout.write(`probe=${label}:download:${String(error.message || error).slice(0, 240)}\n`);
+      }
+    } catch (error) {
+      process.stdout.write(`probe=${label}:create-or-finalize:${String(error.message || error).slice(0, 240)}\n`);
+    }
+  }
+}
+
 function writeOutput(name, value) {
   if (process.env.GITHUB_OUTPUT) {
     fs.appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value}\n`);
@@ -251,6 +317,10 @@ async function main() {
   }
 
   const ids = backendIds(token);
+  if (process.env.MIME_PROBE === '1') {
+    await probeMimeStrategies(token, githubRepository, ids);
+    return;
+  }
   const artifactName = `repo-cassette-${process.env.GITHUB_RUN_ID || Date.now()}-${process.env.GITHUB_RUN_ATTEMPT || 1}.json`;
   const common = {
     workflow_run_backend_id: ids.workflowRunBackendId,
