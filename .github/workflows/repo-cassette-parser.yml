@@ -1,0 +1,25 @@
+name: Repo Cassette parser matrix
+
+on:
+  push:
+    paths:
+      - 'raw-probe.js'
+      - '.github/workflows/repo-cassette-parser.yml'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Probe JSON and protobuf parser discrepancies
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node raw-probe.js
