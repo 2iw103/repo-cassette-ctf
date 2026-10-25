@@ -1,0 +1,5 @@
+name: Repo Cassette artifact redirect probe
+description: Inspect artifact download redirect structure and query propagation
+runs:
+  using: node20
+  main: index.js
