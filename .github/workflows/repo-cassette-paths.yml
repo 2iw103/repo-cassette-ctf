@@ -1,0 +1,26 @@
+name: Repo Cassette artifact redirect paths
+
+on:
+  push:
+    paths:
+      - 'path-probe-action/**'
+      - '.github/workflows/repo-cassette-paths.yml'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Inspect redacted artifact redirects and path variants
+        uses: ./path-probe-action
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: '12593463850'
