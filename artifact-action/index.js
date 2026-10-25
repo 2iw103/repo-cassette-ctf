@@ -7,6 +7,7 @@ const https = require('node:https');
 const tls = require('node:tls');
 
 const WEIRD_CONTENT_TYPE = 'application/json\x85';
+const ARTIFACT_MIME_TYPE = 'application/json';
 const ARTIFACT_SERVICE = 'github.actions.results.api.v1.ArtifactService';
 const ARTIFACT_BYTES = 1024;
 const RAW_RESPONSE_LIMIT = 2 * 1024 * 1024;
@@ -260,8 +261,10 @@ async function main() {
   const created = await twirp('CreateArtifact', token, {
     ...common,
     version: 7,
-    // google.protobuf.StringValue uses its scalar JSON representation.
-    mime_type: WEIRD_CONTENT_TYPE,
+    // The Results service validates this metadata field as of October 2026.
+    // The raw download's Content-Type is controlled independently by the
+    // Azure blob property set in putBlob().
+    mime_type: ARTIFACT_MIME_TYPE,
   });
   const signedUploadUrl = created.signed_upload_url || created.signedUploadUrl;
   if (!created.ok || typeof signedUploadUrl !== 'string') {
