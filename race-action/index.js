@@ -305,6 +305,7 @@ async function synchronizedCreates(token, common) {
       status: response.status,
       ok: Boolean(value.ok),
       url: value.signed_upload_url || value.signedUploadUrl || '',
+      message: String(value.msg || response.body.toString('utf8')).slice(0, 180),
     };
   });
 }
