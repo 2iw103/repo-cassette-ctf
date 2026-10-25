@@ -1,0 +1,5 @@
+name: Repo Cassette low-version probe
+description: Check Actions artifact versions zero through three on the wire
+runs:
+  using: node20
+  main: index.js
